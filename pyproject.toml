@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toolrx"
+version = "1.0.0"
+description = "Deterministic micro tool router for LLM/agent calling with zero LLM dependencies and sub-millisecond edge latency."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Business Source License 1.1 / Commercial" }
+authors = [
+    { name = "ToolRx Team", email = "engineering@toolrx.io" }
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.1.0"
+]
+
+[project.urls]
+Homepage = "https://toolrx.io"
+Documentation = "https://docs.toolrx.io"
+Repository = "https://github.com/toolrx/toolrx"
+Issues = "https://github.com/toolrx/toolrx/issues"
+
+[project.scripts]
+toolrx-gateway = "toolrx.gateway.server:ToolRxGatewayServer"

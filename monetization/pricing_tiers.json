@@ -1,0 +1,45 @@
+{
+  "product": "ToolRx",
+  "upstream_repository": "https://github.com/BoogerCheeseOnRye/toolrx",
+  "billing_model": "recurring_subscription_only",
+  "tiers": [
+    {
+      "name": "Community / Open Source",
+      "price": "$0 / month (Free)",
+      "billing_interval": "monthly",
+      "target_audience": "Hobbyists, students, open-source contributors (similar to OpenCode free tier)",
+      "features": [
+        "Core deterministic trie & token router",
+        "Open source community license (BSL 1.1 / MIT non-commercial)",
+        "Local synchronous execution in Python standard library",
+        "Nightly updates from boogercheeseonrye/toolrx"
+      ]
+    },
+    {
+      "name": "ToolRx Pro",
+      "price": "$49.00 / month",
+      "billing_interval": "monthly",
+      "target_audience": "Indie hackers, agent builders, startups",
+      "features": [
+        "Everything in Community tier",
+        "OpenAI & Anthropic drop-in payload optimizers (saves 93%+ tokens)",
+        "License key for commercial deployment up to 500k monthly tool routes",
+        "Automated nightly upstream sync builds",
+        "Email support & private Discord/GitHub discussions"
+      ]
+    },
+    {
+      "name": "ToolRx Commercial",
+      "price": "$200.00 / month",
+      "billing_interval": "monthly",
+      "target_audience": "High-throughput production agents, platforms, enterprise teams",
+      "features": [
+        "Everything in Pro tier",
+        "Hosted Edge Gateway access (/v1/route, /v1/optimize)",
+        "Unlimited commercial tool routing volume",
+        "Telemetry, drift detection & real-time latency dashboard",
+        "Priority architectural advisory & custom trigger dictionaries"
+      ]
+    }
+  ]
+}
