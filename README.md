@@ -5,8 +5,11 @@
 [![Tests: 15/15 Passed](https://img.shields.io/badge/Tests-15%2F15%20Passing-brightgreen.svg)](tests/)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](pyproject.toml)
 [![Zero External Dependencies](https://img.shields.io/badge/Dependencies-Zero-success.svg)](setup.py)
+[![Get ToolRx](https://img.shields.io/badge/Polar-Community_%7C_Pro_%7C_Commercial-blue.svg)](https://buy.polar.sh/polar_cl_oR8bnsHG4DuotdHtTdpmfYAnklv3WMMNskqmD2Po8DX)
 
 **ToolRx** is a commercial-grade deterministic micro tool router for LLM tool calling. It prunes massive catalogs of 50 to 500+ tools down to the exact top-3 relevant tools in **sub-millisecond speed** with **zero LLM dependencies**, slashing prompt token costs by **90% to 99%** while eliminating tool hallucination.
+
+👉 **[Get ToolRx (Community Free / Pro $49/mo / Commercial $200/mo)](https://buy.polar.sh/polar_cl_oR8bnsHG4DuotdHtTdpmfYAnklv3WMMNskqmD2Po8DX)**
 
 ---
 

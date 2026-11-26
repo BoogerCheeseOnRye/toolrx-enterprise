@@ -4,7 +4,7 @@ Prunes tool schemas before sending to Claude models.
 """
 
 from typing import Dict, List, Any, Optional
-from ..router import ToolRouter
+from ..compat import ToolRouter
 
 class ToolRxAnthropic:
     """Drop-in adapter for Anthropic Messages payloads."""

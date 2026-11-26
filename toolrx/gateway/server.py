@@ -7,7 +7,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import urllib.parse
 from typing import Dict, Any, Optional
-from ..router import ToolRouter
+from ..compat import ToolRouter
 from .auth import AuthManager
 from .telemetry import TelemetryCollector
 

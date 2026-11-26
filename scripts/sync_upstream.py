@@ -38,8 +38,8 @@ def sync():
     if os.path.exists(upstream_core):
         for root, dirs, files in os.walk(upstream_core):
             for file in files:
-                # Do not overwrite commercial gateway or proprietary adapters
-                if file in ["gateway.py", "license.py"]:
+                # Do not overwrite commercial wrapper, gateway, or package init
+                if file in ["gateway.py", "license.py", "compat.py", "__init__.py"]:
                     continue
                 rel_path = os.path.relpath(os.path.join(root, file), upstream_core)
                 target_file = os.path.join(dest_core, rel_path)

@@ -1,0 +1,5011 @@
+/* toolrx deterministic skills.
+ *
+ * A data-driven command library (toolrx/web/commands.json) plus a planner that
+ * runs several steps in order. Everything here is pattern matching + explicit
+ * handlers: no model decides arguments, so the same prompt always produces the
+ * same plan and the same output.
+ *
+ * Exposes: self.toolrxSkills = { init, count, categories, match, splitPrompt,
+ *                               exec, runPrompt, search }
+ */
+(function (root) {
+  "use strict";
+
+  /* One source of numeric envelopes: toolrx/limits.json, generated into
+   * toolrx/web/limits.js by toolrx/gen_limits.py. Loading this script without
+   * the limits file is a wiring bug, so fail loudly instead of guessing. */
+  const LIMITS_RAW = (function () {
+    if (!root.toolrxLimits) {
+      throw new Error("toolrx/web/limits.js must load before skills.js");
+    }
+    return root.toolrxLimits;
+  })();
+  const MAX_OUT = LIMITS_RAW.outputChars;
+  const PRONOUN = /^(?:it|that|this|the text|the result|the output|previous|above|same)$/i;
+
+  let COMMANDS = [];
+  let BY_OP = Object.create(null);
+  let LIBRARY = null;
+  let MACROS = null;
+  let meta = { count: 0, categories: {} };
+
+  /* Reply-language preference. Packs localize the shell's own short messages
+   * only; command output and user data are never translated. Unknown packs
+   * fall back to English, and the preference survives a page reload. */
+  const REPLY_KEY = "toolrx.reply.lang";
+  let replyPref = null;
+
+  function replyLang() {
+    if (replyPref) return replyPref;
+    try {
+      const stored = root.localStorage && root.localStorage.getItem(REPLY_KEY);
+      const L = root.toolrxLang;
+      const code = stored && L && L.replyLang ? L.replyLang(stored) : null;
+      if (code) { replyPref = code; return code; }
+    } catch (e) { /* storage disabled */ }
+    replyPref = "en";
+    return replyPref;
+  }
+
+  function setReplyLang(code) {
+    const L = root.toolrxLang;
+    const next = (L && L.replyLang && L.replyLang(code)) || "en";
+    replyPref = next;
+    try {
+      if (root.localStorage) root.localStorage.setItem(REPLY_KEY, next);
+    } catch (e) { /* storage disabled */ }
+    return next;
+  }
+
+  function shellSay(key, code) {
+    const L = root.toolrxLang;
+    if (!L || !L.say) return "";
+    return L.say(code || replyLang(), key);
+  }
+
+  function fillLang(template, code) {
+    const L = root.toolrxLang;
+    const name = L && L.replyName ? L.replyName(code) : String(code || "").toUpperCase();
+    return String(template == null ? "" : template).replace(/\{lang\}/g, name);
+  }
+
+  /* ---------------------------------------------------------- numbers --- */
+  const WORDS = {
+    zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7,
+    eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13,
+    fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18,
+    nineteen: 19, twenty: 20,
+  };
+
+  function num(v) {
+    if (typeof v === "number") return v;
+    if (v === null || v === undefined) return NaN;
+    let s = String(v).trim().toLowerCase().replace(/,/g, "");
+    if (s in WORDS) return WORDS[s];
+    if (/^-?\d*\.?\d+$/.test(s)) return parseFloat(s);
+    return NaN;
+  }
+
+  function numOrThrow(v) {
+    const n = num(v);
+    if (!isFinite(n)) throw new Error(`not a number: ${v}`);
+    return n;
+  }
+
+  /* The last number in a previous step's output, so "square the result" works
+   * even when the previous line was "5 km = 3.106856 mi". */
+  function prevNumber(text) {
+    const found = String(text === undefined || text === null ? "" : text)
+      .match(/-?\d[\d,]*(?:\.\d+)?/g);
+    if (!found || !found.length) return NaN;
+    return num(found[found.length - 1]);
+  }
+
+  function fmt(n) {
+    if (typeof n !== "number" || !isFinite(n)) return String(n);
+    if (Number.isInteger(n) && Math.abs(n) < 1e21) return String(n);
+    const r = Math.round(n * 1e10) / 1e10;
+    return String(r);
+  }
+
+  function int(n) {
+    return Math.trunc(n);
+  }
+
+  /* ------------------------------------------------------- expressions --- */
+  /* One bounded pure evaluator behind `math.expr` (step 63). It accepts
+   * arithmetic, quoted strings, booleans, null, arrays, local assignments,
+   * comparisons, and a fixed set of pure builtins. Statements are separated
+   * by `|`, `;`, or a newline; `|` is the form that survives chat planning.
+   *
+   * It is not a shell. Names resolve only against the builtin table and the
+   * locals declared earlier in the same script, so an unknown name refuses
+   * before anything is evaluated. Nothing here can read a file, touch the
+   * network, start a timer, use storage, or reach the DOM. Every cap comes
+   * from toolrx/limits.json and a refusal names the cap it hit. */
+
+  const COMPUTE_DENY = Object.create(null);
+  [
+    "eval", "function", "new", "import", "require", "process", "globalthis",
+    "window", "document", "localstorage", "sessionstorage", "indexeddb",
+    "fetch", "xmlhttprequest", "websocket", "worker", "sharedworker",
+    "importscripts", "sendbeacon", "navigator", "location", "history",
+    "alert", "confirm", "prompt", "settimeout", "setinterval", "cleartimeout",
+    "clearinterval", "requestanimationframe", "queuemicrotask", "fs", "os",
+    "sys", "subprocess", "child_process", "open", "exec", "execfile", "spawn",
+    "compile", "__proto__", "prototype", "constructor", "reflect", "proxy",
+    "symbol", "math", "date", "regexp", "object", "array", "string",
+    "boolean", "json", "atom", "deno", "bun", "postmessage", "crypto",
+    "this", "self", "parent", "top", "frames", "opener"
+  ].forEach(function (name) { COMPUTE_DENY[name] = true; });
+
+  const COMPUTE_BUILTINS = {
+    abs: [1, 1], round: [1, 1], floor: [1, 1], ceil: [1, 1],
+    sqrt: [1, 1], cbrt: [1, 1], sign: [1, 1],
+    sin: [1, 1], cos: [1, 1], tan: [1, 1], log: [1, 1], ln: [1, 1], exp: [1, 1],
+    min: [1, 8], max: [1, 8], pow: [2, 2],
+    upper: [1, 1], lower: [1, 1], trim: [1, 1], title: [1, 1],
+    reverse: [1, 1], replace: [3, 3], split: [2, 2], join: [2, 2],
+    slice: [2, 3], repeat: [2, 2], contains: [2, 2], starts: [2, 2],
+    ends: [2, 2], length: [1, 1], count: [1, 1], sum: [1, 1],
+    sort: [1, 1], unique: [1, 1], first: [1, 1], last: [1, 1],
+    str: [1, 1], number: [1, 1], type: [1, 1]
+  };
+  const COMPUTE_CONST = { pi: Math.PI, e: Math.E };
+
+  const COMPUTE_CAPS = {
+    chars: LIMITS_RAW.computeChars,
+    statements: LIMITS_RAW.computeStatements,
+    ops: LIMITS_RAW.computeOps,
+    vars: LIMITS_RAW.computeVars,
+    ms: LIMITS_RAW.computeMs,
+    resultChars: LIMITS_RAW.computeResultChars
+  };
+
+  function computeFail(message, capName) {
+    const e = new Error(message);
+    e.compute = true;
+    e.cap = capName || "";
+    return e;
+  }
+
+  function computeType(v) {
+    if (v === null) return "null";
+    if (Array.isArray(v)) return "array";
+    return typeof v;
+  }
+
+  /* Fixed decimal form so Python and JavaScript print the same bytes. */
+  function computeNumber(n) {
+    if (typeof n !== "number" || !isFinite(n)) {
+      throw computeFail("compute error: result is not a finite number");
+    }
+    if (n === 0) return "0";
+    if (Number.isInteger(n) && Math.abs(n) < 1e21) return String(n);
+    const abs = Math.abs(n);
+    if (abs >= 1e-6 && abs < 1e21) {
+      return n.toFixed(10).replace(/0+$/, "").replace(/\.$/, "");
+    }
+    const parts = n.toExponential(10).split("e");
+    const mant = parts[0].replace(/0+$/, "").replace(/\.$/, "");
+    const exp = parseInt(parts[1], 10);
+    return mant + "e" + (exp >= 0 ? "+" : "-") + Math.abs(exp);
+  }
+
+  function computeQuote(s) {
+    return '"' + String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+      .replace(/\n/g, "\\n").replace(/\t/g, "\\t").replace(/\r/g, "\\r") + '"';
+  }
+
+  function computeRender(v, top) {
+    if (typeof v === "number") return computeNumber(v);
+    if (typeof v === "string") return top ? v : computeQuote(v);
+    if (typeof v === "boolean") return v ? "true" : "false";
+    if (v === null) return "null";
+    if (Array.isArray(v)) {
+      return "[" + v.map(function (item) {
+        return computeRender(item, false);
+      }).join(", ") + "]";
+    }
+    throw computeFail("compute error: cannot show a " + computeType(v));
+  }
+
+  function computeEqual(a, b) {
+    if (Array.isArray(a) || Array.isArray(b)) {
+      if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) if (!computeEqual(a[i], b[i])) return false;
+      return true;
+    }
+    if (a === null || b === null) return a === b;
+    if (typeof a !== typeof b) return false;
+    return a === b;
+  }
+
+  function computeChars(s) { return Array.from(String(s)); }
+
+  function computeAsciiUpper(s) {
+    return s.replace(/[a-z]/g, function (c) {
+      return String.fromCharCode(c.charCodeAt(0) - 32);
+    });
+  }
+
+  function computeAsciiLower(s) {
+    return s.replace(/[A-Z]/g, function (c) {
+      return String.fromCharCode(c.charCodeAt(0) + 32);
+    });
+  }
+
+  function computeAsNumber(v, fn) {
+    if (typeof v !== "number" || !isFinite(v)) {
+      throw computeFail("compute error: " + fn + " needs a number");
+    }
+    return v;
+  }
+
+  function computeAsInt(v, fn) {
+    const n = computeAsNumber(v, fn);
+    if (!Number.isInteger(n)) throw computeFail("compute error: " + fn + " needs an integer");
+    return n;
+  }
+
+  function computeAsString(v, fn) {
+    if (typeof v !== "string") throw computeFail("compute error: " + fn + " needs a string");
+    return v;
+  }
+
+  function computeAsArray(v, fn) {
+    if (!Array.isArray(v)) throw computeFail("compute error: " + fn + " needs an array");
+    return v;
+  }
+
+  function computePow(a, b) {
+    if (a === 0 && b < 0) throw computeFail("compute error: division by zero");
+    if (a < 0 && !Number.isInteger(b)) {
+      throw computeFail("compute error: power of a negative number");
+    }
+    const v = Math.pow(a, b);
+    if (!isFinite(v)) throw computeFail("compute error: result is not a finite number");
+    return v;
+  }
+
+  function computeIndex(obj, idx) {
+    const i = computeAsInt(idx, "index");
+    if (typeof obj === "string") {
+      const chars = computeChars(obj);
+      if (i < 0 || i >= chars.length) {
+        throw computeFail("compute error: index " + i + " is out of range");
+      }
+      return chars[i];
+    }
+    const xs = computeAsArray(obj, "index");
+    if (i < 0 || i >= xs.length) {
+      throw computeFail("compute error: index " + i + " is out of range");
+    }
+    return xs[i];
+  }
+
+  function computeSliceValue(v, start, end) {
+    const isText = typeof v === "string";
+    const list = isText ? computeChars(v) : computeAsArray(v, "slice");
+    const len = list.length;
+    const norm = function (n) {
+      return n < 0 ? Math.max(len + n, 0) : Math.min(n, len);
+    };
+    const a = norm(start);
+    let b = end === undefined ? len : norm(end);
+    if (b < a) b = a;
+    const out = list.slice(a, b);
+    return isText ? out.join("") : out;
+  }
+
+  function computeCmp(a, b) {
+    const A = computeChars(a), B = computeChars(b);
+    const n = Math.min(A.length, B.length);
+    for (let i = 0; i < n; i++) {
+      const x = A[i].codePointAt(0), y = B[i].codePointAt(0);
+      if (x !== y) return x < y ? -1 : 1;
+    }
+    return A.length === B.length ? 0 : (A.length < B.length ? -1 : 1);
+  }
+
+  function computeBinary(op, a, b) {
+    if (op === "==") return computeEqual(a, b);
+    if (op === "!=") return !computeEqual(a, b);
+    if (op === "<" || op === "<=" || op === ">" || op === ">=") {
+      let c;
+      if (typeof a === "number" && typeof b === "number") {
+        c = a === b ? 0 : (a < b ? -1 : 1);
+      } else if (typeof a === "string" && typeof b === "string") {
+        c = computeCmp(a, b);
+      } else {
+        throw computeFail("compute error: cannot compare a " + computeType(a)
+          + " and a " + computeType(b));
+      }
+      if (op === "<") return c < 0;
+      if (op === "<=") return c <= 0;
+      if (op === ">") return c > 0;
+      return c >= 0;
+    }
+    if (op === "+") {
+      if (typeof a === "string" || typeof b === "string") {
+        return (typeof a === "string" ? a : computeRender(a, false))
+          + (typeof b === "string" ? b : computeRender(b, false));
+      }
+      return computeAsNumber(a, "+") + computeAsNumber(b, "+");
+    }
+    const x = computeAsNumber(a, op), y = computeAsNumber(b, op);
+    if (op === "-") return x - y;
+    if (op === "*") return x * y;
+    if (op === "/") {
+      if (y === 0) throw computeFail("compute error: division by zero");
+      return x / y;
+    }
+    if (op === "%") {
+      if (y === 0) throw computeFail("compute error: division by zero");
+      return x % y;
+    }
+    if (op === "^") return computePow(x, y);
+    throw computeFail("compute error: unknown operator " + op);
+  }
+
+  function computeCall(name, args) {
+    switch (name) {
+      case "abs": return Math.abs(computeAsNumber(args[0], name));
+      case "round": {
+        const n = computeAsNumber(args[0], name);
+        return (n < 0 ? -1 : 1) * Math.floor(Math.abs(n) + 0.5);
+      }
+      case "floor": return Math.floor(computeAsNumber(args[0], name));
+      case "ceil": return Math.ceil(computeAsNumber(args[0], name));
+      case "sqrt": {
+        const n = computeAsNumber(args[0], name);
+        if (n < 0) throw computeFail("compute error: square root of a negative number");
+        return Math.sqrt(n);
+      }
+      case "cbrt": return Math.cbrt(computeAsNumber(args[0], name));
+      case "sign": {
+        const n = computeAsNumber(args[0], name);
+        return n === 0 ? 0 : (n > 0 ? 1 : -1);
+      }
+      case "sin": return Math.sin(computeAsNumber(args[0], name));
+      case "cos": return Math.cos(computeAsNumber(args[0], name));
+      case "tan": return Math.tan(computeAsNumber(args[0], name));
+      case "log": return Math.log10(computeAsNumber(args[0], name));
+      case "ln": return Math.log(computeAsNumber(args[0], name));
+      case "exp": return Math.exp(computeAsNumber(args[0], name));
+      case "min":
+      case "max": {
+        const xs = args.map(function (v) { return computeAsNumber(v, name); });
+        return name === "min" ? Math.min.apply(null, xs) : Math.max.apply(null, xs);
+      }
+      case "pow":
+        return computePow(computeAsNumber(args[0], name), computeAsNumber(args[1], name));
+      case "upper": return computeAsciiUpper(computeAsString(args[0], name));
+      case "lower": return computeAsciiLower(computeAsString(args[0], name));
+      case "title": {
+        const s = computeAsString(args[0], name);
+        return s.replace(/[A-Za-z]+/g, function (w) {
+          return computeAsciiUpper(w[0]) + computeAsciiLower(w.slice(1));
+        });
+      }
+      case "trim":
+        return computeAsString(args[0], name)
+          .replace(/^[ \t\r\n\f\v]+/, "").replace(/[ \t\r\n\f\v]+$/, "");
+      case "reverse": {
+        const v = args[0];
+        if (typeof v === "string") return computeChars(v).reverse().join("");
+        return computeAsArray(v, name).slice().reverse();
+      }
+      case "replace": {
+        const s = computeAsString(args[0], name);
+        const from = computeAsString(args[1], name);
+        const to = computeAsString(args[2], name);
+        if (!from) throw computeFail("compute error: replace needs a non-empty search string");
+        return s.split(from).join(to);
+      }
+      case "split": {
+        const s = computeAsString(args[0], name);
+        const sep = computeAsString(args[1], name);
+        if (!sep) throw computeFail("compute error: split needs a non-empty separator");
+        return s.split(sep);
+      }
+      case "join": {
+        const xs = computeAsArray(args[0], name);
+        const sep = computeAsString(args[1], name);
+        return xs.map(function (v) {
+          return typeof v === "string" ? v : computeRender(v, false);
+        }).join(sep);
+      }
+      case "slice": {
+        const start = computeAsInt(args[1], name);
+        const end = args.length > 2 ? computeAsInt(args[2], name) : undefined;
+        return computeSliceValue(args[0], start, end);
+      }
+      case "repeat": {
+        const s = computeAsString(args[0], name);
+        const n = computeAsInt(args[1], name);
+        if (n < 0 || n > 1000) throw computeFail("compute error: repeat needs 0-1000");
+        return s.repeat(n);
+      }
+      case "contains": {
+        if (typeof args[0] === "string") {
+          return args[0].indexOf(computeAsString(args[1], name)) >= 0;
+        }
+        const xs = computeAsArray(args[0], name);
+        return xs.some(function (v) { return computeEqual(v, args[1]); });
+      }
+      case "starts":
+        return computeAsString(args[0], name)
+          .indexOf(computeAsString(args[1], name)) === 0;
+      case "ends": {
+        const s = computeAsString(args[0], name);
+        const t = computeAsString(args[1], name);
+        return s.length >= t.length && s.slice(s.length - t.length) === t;
+      }
+      case "length":
+      case "count": {
+        const v = args[0];
+        if (typeof v === "string") return computeChars(v).length;
+        if (Array.isArray(v)) return v.length;
+        throw computeFail("compute error: " + name + " needs a string or an array");
+      }
+      case "sum": {
+        const xs = computeAsArray(args[0], name);
+        let total = 0;
+        xs.forEach(function (v) { total += computeAsNumber(v, name); });
+        return total;
+      }
+      case "sort": {
+        const xs = computeAsArray(args[0], name);
+        const allNum = xs.every(function (v) { return typeof v === "number"; });
+        const allStr = xs.every(function (v) { return typeof v === "string"; });
+        if (!allNum && !allStr) {
+          throw computeFail("compute error: sort needs all numbers or all strings");
+        }
+        return xs.slice().sort(allNum
+          ? function (a, b) { return a - b; }
+          : function (a, b) { return computeCmp(a, b); });
+      }
+      case "unique": {
+        const xs = computeAsArray(args[0], name);
+        const out = [];
+        xs.forEach(function (v) {
+          if (!out.some(function (w) { return computeEqual(v, w); })) out.push(v);
+        });
+        return out;
+      }
+      case "first":
+      case "last": {
+        const v = args[0];
+        const list = typeof v === "string" ? computeChars(v) : computeAsArray(v, name);
+        if (!list.length) {
+          throw computeFail("compute error: " + name + " needs a non-empty value");
+        }
+        return name === "first" ? list[0] : list[list.length - 1];
+      }
+      case "str": return computeRender(args[0], true);
+      case "number": {
+        const v = args[0];
+        if (typeof v === "number") return v;
+        if (typeof v === "string" && /^-?\d+(?:\.\d+)?$/.test(v)) return parseFloat(v);
+        throw computeFail("compute error: number needs a numeric string");
+      }
+      case "type": return computeType(args[0]);
+      default: throw computeFail("compute error: unknown name " + name);
+    }
+  }
+
+  function computeTokens(src) {
+    const s = String(src);
+    const out = [];
+    let i = 0;
+    while (i < s.length) {
+      const c = s[i];
+      if (c === " " || c === "\t" || c === "\r" || c === "\n") { i++; continue; }
+      if ((c >= "0" && c <= "9")
+          || (c === "." && s[i + 1] >= "0" && s[i + 1] <= "9")) {
+        const m = /^\d*\.?\d+(?:[eE][+-]?\d+)?/.exec(s.slice(i));
+        out.push({ t: "num", v: parseFloat(m[0]) });
+        i += m[0].length;
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        const quote = c;
+        i++;
+        let v = "";
+        let closed = false;
+        while (i < s.length) {
+          const d = s[i++];
+          if (d === quote) { closed = true; break; }
+          if (d === "\\") {
+            const e = s[i++];
+            if (e === "n") v += "\n";
+            else if (e === "t") v += "\t";
+            else if (e === "r") v += "\r";
+            else if (e === "\\" || e === '"' || e === "'") v += e;
+            else {
+              throw computeFail("compute error: unknown escape \\"
+                + (e === undefined ? "" : e));
+            }
+          } else v += d;
+        }
+        if (!closed) throw computeFail("compute error: unterminated string");
+        out.push({ t: "str", v: v });
+        continue;
+      }
+      if (/[A-Za-z_]/.test(c)) {
+        const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(i));
+        out.push({ t: "id", v: m[0] });
+        i += m[0].length;
+        continue;
+      }
+      const two = s.slice(i, i + 2);
+      if (two === "==" || two === "!=" || two === "<=" || two === ">=") {
+        out.push({ t: "op", v: two });
+        i += 2;
+        continue;
+      }
+      if ("+-*/%^=<>(),[]".indexOf(c) >= 0) {
+        out.push({ t: "op", v: c });
+        i++;
+        continue;
+      }
+      throw computeFail('compute error: unexpected "' + c + '"');
+    }
+    out.push({ t: "end", v: "" });
+    return out;
+  }
+
+  /* Strip comments and split statements outside strings and brackets. */
+  function computeSplit(src) {
+    const s = String(src);
+    let cleaned = "";
+    let quote = "";
+    let depth = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (quote) {
+        cleaned += c;
+        if (c === "\\") { cleaned += s[i + 1] || ""; i++; continue; }
+        if (c === quote) quote = "";
+        continue;
+      }
+      if (c === '"' || c === "'") { quote = c; cleaned += c; continue; }
+      if (c === "(" || c === "[") { depth++; cleaned += c; continue; }
+      if (c === ")" || c === "]") { depth = Math.max(0, depth - 1); cleaned += c; continue; }
+      if (c === "#" && depth === 0) {
+        while (i < s.length && s[i] !== "\n") i++;
+        cleaned += "\n";
+        continue;
+      }
+      cleaned += c;
+    }
+    const out = [];
+    let start = 0;
+    quote = "";
+    depth = 0;
+    for (let i = 0; i < cleaned.length; i++) {
+      const c = cleaned[i];
+      if (quote) {
+        if (c === "\\") { i++; continue; }
+        if (c === quote) quote = "";
+        continue;
+      }
+      if (c === '"' || c === "'") { quote = c; continue; }
+      if (c === "(" || c === "[") { depth++; continue; }
+      if (c === ")" || c === "]") { depth = Math.max(0, depth - 1); continue; }
+      if ((c === ";" || c === "|" || c === "\n") && depth === 0) {
+        const part = cleaned.slice(start, i).trim();
+        if (part) out.push(part);
+        start = i + 1;
+      }
+    }
+    const tail = cleaned.slice(start).trim();
+    if (tail) out.push(tail);
+    return out;
+  }
+
+  function computeRun(source, limits, clock) {
+    const caps = limits || COMPUTE_CAPS;
+    const text = String(source == null ? "" : source);
+    const totalChars = computeChars(text).length;
+    const fail = function (message, capName) {
+      return { ok: false, error: message, cap: capName || "", ops: 0,
+               vars: 0, statements: 0 };
+    };
+    if (caps.chars && totalChars > caps.chars) {
+      return fail("compute refused: source is " + totalChars
+        + " chars, over computeChars (" + caps.chars + ")", "computeChars");
+    }
+    const parts = computeSplit(text);
+    if (!parts.length) return fail("compute error: nothing to compute");
+    if (caps.statements && parts.length > caps.statements) {
+      return fail("compute refused: " + parts.length + " statements, over "
+        + "computeStatements (" + caps.statements + ")", "computeStatements");
+    }
+    const now = typeof clock === "function" ? clock : Date.now;
+    const started = now();
+    const declared = Object.create(null);
+    let ops = 0;
+    let toks = [];
+    let pos = 0;
+
+    const bump = function (n) {
+      ops += n;
+      if (caps.ops && ops > caps.ops) {
+        throw computeFail("compute refused: " + ops + " operations, over "
+          + "computeOps (" + caps.ops + ")", "computeOps");
+      }
+    };
+    const syntax = function (what) {
+      const t = toks[pos];
+      const near = !t || t.t === "end" ? "end" : String(t.v);
+      return computeFail('compute error: expected ' + what + ' near "' + near + '"');
+    };
+    const isOp = function (v) {
+      return toks[pos] && toks[pos].t === "op" && toks[pos].v === v;
+    };
+    const eat = function (v) { if (isOp(v)) { pos++; return true; } return false; };
+    const expect = function (v, what) { if (!eat(v)) throw syntax(what); };
+
+    const parseExpr = function () { return parseOr(); };
+    const parseOr = function () {
+      let node = parseAnd();
+      while (toks[pos] && toks[pos].t === "id" && toks[pos].v === "or") {
+        pos++;
+        bump(1);
+        node = { t: "bin", op: "or", a: node, b: parseAnd() };
+      }
+      return node;
+    };
+    const parseAnd = function () {
+      let node = parseNot();
+      while (toks[pos] && toks[pos].t === "id" && toks[pos].v === "and") {
+        pos++;
+        bump(1);
+        node = { t: "bin", op: "and", a: node, b: parseNot() };
+      }
+      return node;
+    };
+    const parseNot = function () {
+      if (toks[pos] && toks[pos].t === "id" && toks[pos].v === "not") {
+        pos++;
+        bump(1);
+        return { t: "not", v: parseNot() };
+      }
+      return parseComparison();
+    };
+    const parseComparison = function () {
+      const node = parseAdd();
+      const t = toks[pos];
+      if (t && t.t === "op"
+          && (t.v === "==" || t.v === "!=" || t.v === "<" || t.v === "<="
+            || t.v === ">" || t.v === ">=")) {
+        pos++;
+        bump(1);
+        return { t: "bin", op: t.v, a: node, b: parseAdd() };
+      }
+      return node;
+    };
+    const parseAdd = function () {
+      let node = parseMul();
+      for (;;) {
+        const t = toks[pos];
+        if (t && t.t === "op" && (t.v === "+" || t.v === "-")) {
+          pos++;
+          bump(1);
+          node = { t: "bin", op: t.v, a: node, b: parseMul() };
+        } else break;
+      }
+      return node;
+    };
+    const parseMul = function () {
+      let node = parseUnary();
+      for (;;) {
+        const t = toks[pos];
+        if (t && t.t === "op" && (t.v === "*" || t.v === "/" || t.v === "%")) {
+          pos++;
+          bump(1);
+          node = { t: "bin", op: t.v, a: node, b: parseUnary() };
+        } else break;
+      }
+      return node;
+    };
+    const parseUnary = function () {
+      if (eat("-")) { bump(1); return { t: "neg", v: parseUnary() }; }
+      if (eat("+")) { bump(1); return parseUnary(); }
+      return parsePower();
+    };
+    const parsePower = function () {
+      const base = parsePostfix();
+      if (eat("^")) {
+        bump(1);
+        return { t: "bin", op: "^", a: base, b: parseUnary() };
+      }
+      return base;
+    };
+    const parsePostfix = function () {
+      let node = parsePrimary();
+      for (;;) {
+        if (isOp("[")) {
+          pos++;
+          const idx = parseExpr();
+          expect("]", "]");
+          bump(1);
+          node = { t: "index", obj: node, idx: idx };
+        } else break;
+      }
+      return node;
+    };
+    const parsePrimary = function () {
+      const t = toks[pos];
+      if (!t || t.t === "end") throw syntax("a value");
+      if (t.t === "num") { pos++; bump(1); return { t: "num", v: t.v }; }
+      if (t.t === "str") { pos++; bump(1); return { t: "str", v: t.v }; }
+      if (t.t === "op" && t.v === "(") {
+        pos++;
+        const node = parseExpr();
+        expect(")", ")");
+        return node;
+      }
+      if (t.t === "op" && t.v === "[") {
+        pos++;
+        const items = [];
+        if (!isOp("]")) {
+          for (;;) {
+            items.push(parseExpr());
+            if (!eat(",")) break;
+          }
+        }
+        expect("]", "]");
+        bump(1);
+        return { t: "arr", items: items };
+      }
+      if (t.t === "id") {
+        const name = t.v;
+        if (COMPUTE_DENY[name.toLowerCase()]) {
+          throw computeFail("compute refused: " + name
+            + " is not available in compute", "name");
+        }
+        if (name === "true" || name === "false") {
+          pos++;
+          bump(1);
+          return { t: "bool", v: name === "true" };
+        }
+        if (name === "null") { pos++; bump(1); return { t: "null" }; }
+        if (Object.prototype.hasOwnProperty.call(COMPUTE_CONST, name)
+            && !declared[name]) {
+          pos++;
+          bump(1);
+          return { t: "num", v: COMPUTE_CONST[name] };
+        }
+        if (Object.prototype.hasOwnProperty.call(COMPUTE_BUILTINS, name)) {
+          pos++;
+          expect("(", "(");
+          const args = [];
+          if (!isOp(")")) {
+            for (;;) {
+              args.push(parseExpr());
+              if (!eat(",")) break;
+            }
+          }
+          expect(")", ")");
+          const ar = COMPUTE_BUILTINS[name];
+          if (args.length < ar[0] || args.length > ar[1]) {
+            const want = ar[0] === ar[1] ? String(ar[0]) : ar[0] + "-" + ar[1];
+            throw computeFail("compute error: " + name + " expects " + want
+              + " argument(s)");
+          }
+          bump(1);
+          return { t: "call", name: name, args: args };
+        }
+        if (declared[name]) { pos++; bump(1); return { t: "var", name: name }; }
+        throw computeFail("compute error: unknown name " + name);
+      }
+      throw syntax("a value");
+    };
+    const parseAssign = function (explicit) {
+      const name = toks[pos].v;
+      pos++;
+      expect("=", "=");
+      if (COMPUTE_DENY[name.toLowerCase()]) {
+        throw computeFail("compute refused: " + name
+          + " is not available in compute", "name");
+      }
+      if (Object.prototype.hasOwnProperty.call(COMPUTE_BUILTINS, name)
+          || Object.prototype.hasOwnProperty.call(COMPUTE_CONST, name)) {
+        throw computeFail("compute error: " + name + " is a builtin");
+      }
+      if (explicit && declared[name]) {
+        throw computeFail("compute error: " + name + " is already declared");
+      }
+      if (!declared[name]) {
+        const count = Object.keys(declared).length;
+        if (caps.vars && count >= caps.vars) {
+          throw computeFail("compute refused: " + (count + 1)
+            + " variables, over computeVars (" + caps.vars + ")", "computeVars");
+        }
+        declared[name] = true;
+      }
+      bump(1);
+      return { t: "assign", name: name, value: parseExpr() };
+    };
+    const parseStatement = function () {
+      if (toks[pos] && toks[pos].t === "id" && toks[pos].v === "let"
+          && toks[pos + 1] && toks[pos + 1].t === "id"
+          && toks[pos + 2] && toks[pos + 2].t === "op" && toks[pos + 2].v === "=") {
+        pos++;
+        return parseAssign(true);
+      }
+      if (toks[pos] && toks[pos].t === "id"
+          && toks[pos + 1] && toks[pos + 1].t === "op"
+          && toks[pos + 1].v === "=") {
+        return parseAssign(false);
+      }
+      return parseExpr();
+    };
+
+    const evalNode = function (n, env) {
+      if (caps.ms && now() - started > caps.ms) {
+        throw computeFail("compute refused: took longer than computeMs ("
+          + caps.ms + " ms)", "computeMs");
+      }
+      switch (n.t) {
+        case "num": return n.v;
+        case "str": return n.v;
+        case "bool": return n.v;
+        case "null": return null;
+        case "arr": return n.items.map(function (x) { return evalNode(x, env); });
+        case "var": return env[n.name];
+        case "assign": {
+          const v = evalNode(n.value, env);
+          env[n.name] = v;
+          return v;
+        }
+        case "neg": return -computeAsNumber(evalNode(n.v, env), "-");
+        case "not": {
+          const v = evalNode(n.v, env);
+          if (typeof v !== "boolean") throw computeFail("compute error: not needs a boolean");
+          return !v;
+        }
+        case "index": return computeIndex(evalNode(n.obj, env), evalNode(n.idx, env));
+        case "call": {
+          const args = n.args.map(function (x) { return evalNode(x, env); });
+          return computeCall(n.name, args);
+        }
+        case "bin": {
+          if (n.op === "and" || n.op === "or") {
+            const a = evalNode(n.a, env);
+            if (typeof a !== "boolean") {
+              throw computeFail("compute error: " + n.op + " needs a boolean");
+            }
+            if (n.op === "and" && !a) return false;
+            if (n.op === "or" && a) return true;
+            const b = evalNode(n.b, env);
+            if (typeof b !== "boolean") {
+              throw computeFail("compute error: " + n.op + " needs a boolean");
+            }
+            return b;
+          }
+          return computeBinary(n.op, evalNode(n.a, env), evalNode(n.b, env));
+        }
+        default: throw computeFail("compute error: unknown node");
+      }
+    };
+
+    try {
+      const nodes = [];
+      for (let i = 0; i < parts.length; i++) {
+        toks = computeTokens(parts[i]);
+        pos = 0;
+        nodes.push(parseStatement());
+        if (toks[pos].t !== "end") {
+          throw computeFail('compute error: unexpected "' + String(toks[pos].v) + '"');
+        }
+      }
+      const env = Object.create(null);
+      let value = null;
+      for (let i = 0; i < nodes.length; i++) value = evalNode(nodes[i], env);
+      const outText = computeRender(value, true);
+      const outChars = computeChars(outText).length;
+      if (caps.resultChars && outChars > caps.resultChars) {
+        return fail("compute refused: result is " + outChars
+          + " chars, over computeResultChars (" + caps.resultChars + ")",
+          "computeResultChars");
+      }
+      return { ok: true, text: outText, value: value, ops: ops,
+               vars: Object.keys(declared).length, statements: parts.length };
+    } catch (e) {
+      if (e && e.compute) {
+        return { ok: false, error: e.message, cap: e.cap || "", ops: ops,
+                 vars: Object.keys(declared).length, statements: parts.length };
+      }
+      throw e;
+    }
+  }
+
+  function computeLimits() {
+    return Object.assign({}, COMPUTE_CAPS);
+  }
+
+  function evalExpr(src) {
+    const out = computeRun(src, COMPUTE_CAPS);
+    if (!out.ok) throw new Error(out.error);
+    return out.text;
+  }
+
+  /* ------------------------------------------------------------ utils --- */
+  function decodeEntities(s) {
+    return String(s).replace(/&amp;/g, "&").replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  }
+
+  function resolveText(v, ctx) {
+    if (v === undefined || v === null) return ctx.prev || "";
+    let s = String(v).trim().replace(/^["']|["']$/g, "");
+    if (!s || PRONOUN.test(s)) return ctx.prev || "";
+    if (ctx.fs && /^[\w./-]+$/.test(s) && ctx.fs.exists(s)) return ctx.fs.read(s);
+    return decodeEntities(s);
+  }
+
+  function cap(s) {
+    s = String(s);
+    return s.length > MAX_OUT ? s.slice(0, MAX_OUT) + "\n...[truncated]" : s;
+  }
+
+  function words(s) {
+    return String(s).match(/[A-Za-z0-9']+/g) || [];
+  }
+
+  function b64encode(s) {
+    const bytes = new TextEncoder().encode(s);
+    let bin = "";
+    for (const b of bytes) bin += String.fromCharCode(b);
+    return btoa(bin);
+  }
+
+  function b64decode(s) {
+    const bin = atob(String(s).replace(/\s+/g, ""));
+    const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  }
+
+  function hexEncode(s) {
+    return Array.from(new TextEncoder().encode(s))
+      .map(b => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  function hexDecode(s) {
+    const h = String(s).replace(/[^0-9a-f]/gi, "");
+    const bytes = new Uint8Array(h.length / 2);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(h.substr(i * 2, 2), 16);
+    return new TextDecoder().decode(bytes);
+  }
+
+  const MORSE = {
+    a: ".-", b: "-...", c: "-.-.", d: "-..", e: ".", f: "..-.", g: "--.", h: "....",
+    i: "..", j: ".---", k: "-.-", l: ".-..", m: "--", n: "-.", o: "---", p: ".--.",
+    q: "--.-", r: ".-.", s: "...", t: "-", u: "..-", v: "...-", w: ".--", x: "-..-",
+    y: "-.--", z: "--..", 0: "-----", 1: ".----", 2: "..---", 3: "...--", 4: "....-",
+    5: ".....", 6: "-....", 7: "--...", 8: "---..", 9: "----.",
+  };
+  const UNMORSE = Object.fromEntries(Object.entries(MORSE).map(([k, v]) => [v, k]));
+
+  function fromRoman(s) {
+    const vals = { i: 1, v: 5, x: 10, l: 50, c: 100, d: 500, m: 1000 };
+    let total = 0;
+    const t = String(s).toLowerCase();
+    for (let i = 0; i < t.length; i++) {
+      const v = vals[t[i]], next = vals[t[i + 1]] || 0;
+      total += v < next ? -v : v;
+    }
+    return total;
+  }
+
+  function toRoman(n) {
+    n = Math.trunc(n);
+    if (n < 1 || n > 3999) throw new Error("roman numerals cover 1..3999");
+    const map = [[1000, "M"], [900, "CM"], [500, "D"], [400, "CD"], [100, "C"],
+      [90, "XC"], [50, "L"], [40, "XL"], [10, "X"], [9, "IX"], [5, "V"], [4, "IV"], [1, "I"]];
+    let out = "";
+    for (const [v, s] of map) while (n >= v) { out += s; n -= v; }
+    return out;
+  }
+
+  const ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen"];
+  const TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+
+  function numberToWords(n) {
+    n = Math.trunc(n);
+    if (n < 0) return "minus " + numberToWords(-n);
+    if (n < 20) return ONES[n];
+    if (n < 100) return TENS[Math.floor(n / 10)] + (n % 10 ? "-" + ONES[n % 10] : "");
+    if (n < 1000) return ONES[Math.floor(n / 100)] + " hundred" + (n % 100 ? " " + numberToWords(n % 100) : "");
+    const scales = [[1e12, "trillion"], [1e9, "billion"], [1e6, "million"], [1e3, "thousand"]];
+    for (const [v, name] of scales) {
+      if (n >= v) {
+        return numberToWords(Math.floor(n / v)) + " " + name +
+          (n % v ? " " + numberToWords(n % v) : "");
+      }
+    }
+    return String(n);
+  }
+
+  function ordinal(n) {
+    n = Math.trunc(n);
+    const s = ["th", "st", "nd", "rd"], v = n % 100;
+    return n + (s[(v - 20) % 10] || s[v] || s[0]);
+  }
+
+  function hashText(algo, text) {
+    const name = String(algo).toLowerCase();
+    if (name === "blake2b" || name === "blake2b-256") return root.blake2bHex(text, null, 32);
+    if (name === "blake2b-512") return root.blake2bHex(text, null, 64);
+    if (name === "sha256" && root.crypto && crypto.subtle) {
+      return crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))
+        .then(buf => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join(""));
+    }
+    throw new Error(`unsupported hash: ${algo}`);
+  }
+
+  function parseFlags(p) {
+    const m = /^\/(.*)\/([a-z]*)$/.exec(String(p).trim());
+    if (m) return { re: new RegExp(m[1], m[2]), src: m[1] };
+    return { re: new RegExp(String(p)), src: String(p) };
+  }
+
+  /* --------------------------------------------------------- unit math --- */
+  const FACTORS = {
+    length: { mm: .001, cm: .01, m: 1, km: 1000, in: .0254, ft: .3048, yd: .9144, mi: 1609.344, nmi: 1852 },
+    mass: { mg: .001, g: 1, kg: 1000, t: 1e6, oz: 28.349523125, lb: 453.59237, st: 6350.29318 },
+    volume: { ml: .001, l: 1, tsp: .00492892159375, tbsp: .01478676478125, floz: .0295735295625,
+      cup: .2365882365, pt: .473176473, qt: .946352946, gal: 3.785411784 },
+    data: { kb: 1e3, mb: 1e6, gb: 1e9, tb: 1e12, kib: 1024, mib: 1048576, gib: 1073741824 },
+    time: { ms: .001, s: 1, min: 60, h: 3600, day: 86400, week: 604800 },
+    speed: { mps: 1, kph: 1 / 3.6, mph: 0.44704, knot: 1852 / 3600 },
+    area: { mm2: 1e-6, cm2: 1e-4, m2: 1, km2: 1e6, ha: 1e4, acre: 4046.8564224,
+      ft2: .09290304, in2: .00064516 },
+    energy: { j: 1, kj: 1000, cal: 4.184, kcal: 4184, wh: 3600, kwh: 3.6e6 },
+    pressure: { pa: 1, kpa: 1000, bar: 1e5, atm: 101325, psi: 6894.757293, mmhg: 133.322387 },
+    angle: { deg: 1, rad: 57.29577951308232, grad: .9 },
+  };
+
+  const UNIT_LABEL = {
+    mm: "mm", cm: "cm", m: "m", km: "km", in: "in", ft: "ft", yd: "yd", mi: "mi",
+    nmi: "nmi", mg: "mg", g: "g", kg: "kg", t: "t", oz: "oz", lb: "lb", st: "st",
+    ml: "mL", l: "L", tsp: "tsp", tbsp: "tbsp", floz: "fl oz", cup: "cups", pt: "pt",
+    qt: "qt", gal: "gal", kb: "KB", mb: "MB", gb: "GB", tb: "TB", kib: "KiB",
+    mib: "MiB", gib: "GiB", ms: "ms", s: "s", min: "min", h: "h", day: "days",
+    week: "weeks", mps: "m/s", kph: "km/h", mph: "mph", knot: "kn", mm2: "mm²",
+    cm2: "cm²", m2: "m²", km2: "km²", ha: "ha", acre: "ac", ft2: "ft²", in2: "in²",
+    j: "J", kj: "kJ", cal: "cal", kcal: "kcal", wh: "Wh", kwh: "kWh", pa: "Pa",
+    kpa: "kPa", bar: "bar", atm: "atm", psi: "psi", mmhg: "mmHg", deg: "°", rad: "rad",
+    grad: "grad", c: "°C", f: "°F", k: "K",
+  };
+
+  function convertUnit(n, from, to) {
+    if (from === to) return n;
+    const temp = { c: v => v, f: v => (v - 32) * 5 / 9, k: v => v - 273.15 };
+    const untemp = { c: v => v, f: v => v * 9 / 5 + 32, k: v => v + 273.15 };
+    if (from in temp && to in untemp) return untemp[to](temp[from](n));
+    for (const cat in FACTORS) {
+      const f = FACTORS[cat];
+      if (from in f && to in f) return n * f[from] / f[to];
+    }
+    throw new Error(`no conversion from ${from} to ${to}`);
+  }
+
+  /* -------------------------------------------------------------- color --- */
+  function parseColor(c) {
+    const s = String(c).trim();
+    let m = /^#?([0-9a-f]{3})$/i.exec(s);
+    if (m) return [parseInt(m[1][0] + m[1][0], 16), parseInt(m[1][1] + m[1][1], 16), parseInt(m[1][2] + m[1][2], 16)];
+    m = /^#?([0-9a-f]{6})$/i.exec(s);
+    if (m) return [0, 2, 4].map(i => parseInt(m[1].substr(i, 2), 16));
+    m = /^rgba?\(?\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)/i.exec(s);
+    if (m) return [m[1], m[2], m[3]].map(Number);
+    throw new Error(`not a color: ${c}`);
+  }
+
+  function toHex(rgb) {
+    return "#" + rgb.map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0")).join("");
+  }
+
+  function luminance(rgb) {
+    const [r, g, b] = rgb.map(v => {
+      v /= 255;
+      return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  }
+
+  function contrast(a, b) {
+    const la = luminance(parseColor(a)), lb = luminance(parseColor(b));
+    const hi = Math.max(la, lb), lo = Math.min(la, lb);
+    return (hi + 0.05) / (lo + 0.05);
+  }
+
+  /* --------------------------------------------------------------- CSV --- */
+  function parseCSV(text) {
+    const rows = [];
+    let row = [], field = "", quoted = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (quoted) {
+        if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
+        else if (c === '"') quoted = false;
+        else field += c;
+      } else if (c === '"') quoted = true;
+      else if (c === ",") { row.push(field); field = ""; }
+      else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+      else if (c !== "\r") field += c;
+    }
+    if (field || row.length) { row.push(field); rows.push(row); }
+    return rows.filter(r => r.some(x => x.trim() !== ""));
+  }
+
+  function csvToJson(text) {
+    const rows = parseCSV(String(text).trim());
+    if (!rows.length) return "[]";
+    const head = rows[0];
+    const objects = rows.slice(1).map(r => {
+      const o = {};
+      head.forEach((h, i) => { o[h.trim()] = r[i] === undefined ? "" : r[i]; });
+      return o;
+    });
+    return JSON.stringify(objects, null, 2);
+  }
+
+  function jsonToCsv(value) {
+    const list = Array.isArray(value) ? value : [value];
+    const keys = Array.from(new Set(list.flatMap(o => Object.keys(o))));
+    const esc = v => {
+      const s = v === null || v === undefined ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    return [keys.join(",")].concat(list.map(o => keys.map(k => esc(o[k])).join(","))).join("\n");
+  }
+
+  function getPath(obj, path) {
+    return String(path).split(".").reduce((o, k) => {
+      if (o === null || o === undefined) return undefined;
+      return o[k.replace(/^\[(\d+)\]$/, "$1")];
+    }, obj);
+  }
+
+  /* ------------------------------------------------------------ seeding --- */
+  function seeded(seed) {
+    let h = 2166136261;
+    for (const ch of String(seed)) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); }
+    return function () {
+      h += 0x6D2B79F5;
+      let t = h;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /* ------------------------------------------------------------ facts ----- */
+  const CAPITALS = {
+    afghanistan: "Kabul", albania: "Tirana", algeria: "Algiers", argentina: "Buenos Aires",
+    armenia: "Yerevan", australia: "Canberra", austria: "Vienna", bangladesh: "Dhaka",
+    belgium: "Brussels", bolivia: "Sucre (seat of government: La Paz)", brazil: "Brasília",
+    bulgaria: "Sofia", cambodia: "Phnom Penh", cameroon: "Yaoundé", canada: "Ottawa",
+    chile: "Santiago", china: "Beijing", colombia: "Bogotá", croatia: "Zagreb",
+    cuba: "Havana", cyprus: "Nicosia", czechia: "Prague", "czech republic": "Prague",
+    denmark: "Copenhagen", ecuador: "Quito", egypt: "Cairo", estonia: "Tallinn",
+    ethiopia: "Addis Ababa", finland: "Helsinki", france: "Paris", georgia: "Tbilisi",
+    germany: "Berlin", ghana: "Accra", greece: "Athens", hungary: "Budapest",
+    iceland: "Reykjavík", india: "New Delhi", indonesia: "Jakarta", iran: "Tehran",
+    iraq: "Baghdad", ireland: "Dublin", israel: "Jerusalem", italy: "Rome",
+    jamaica: "Kingston", japan: "Tokyo", jordan: "Amman", kazakhstan: "Astana",
+    kenya: "Nairobi", "south korea": "Seoul", "north korea": "Pyongyang",
+    latvia: "Riga", lebanon: "Beirut", lithuania: "Vilnius", luxembourg: "Luxembourg",
+    madagascar: "Antananarivo", malaysia: "Kuala Lumpur", mexico: "Mexico City",
+    mongolia: "Ulaanbaatar", morocco: "Rabat", nepal: "Kathmandu", netherlands: "Amsterdam",
+    "new zealand": "Wellington", nigeria: "Abuja", norway: "Oslo", pakistan: "Islamabad",
+    panama: "Panama City", paraguay: "Asunción", peru: "Lima", philippines: "Manila",
+    poland: "Warsaw", portugal: "Lisbon", qatar: "Doha", romania: "Bucharest",
+    russia: "Moscow", "saudi arabia": "Riyadh", senegal: "Dakar", serbia: "Belgrade",
+    singapore: "Singapore", slovakia: "Bratislava", slovenia: "Ljubljana",
+    "south africa": "Pretoria (executive), Cape Town (legislative), Bloemfontein (judicial)",
+    spain: "Madrid", "sri lanka": "Sri Jayawardenepura Kotte", sweden: "Stockholm",
+    switzerland: "Bern", syria: "Damascus", taiwan: "Taipei", tanzania: "Dodoma",
+    thailand: "Bangkok", tunisia: "Tunis", turkey: "Ankara", uganda: "Kampala",
+    ukraine: "Kyiv", "united arab emirates": "Abu Dhabi", uae: "Abu Dhabi",
+    "united kingdom": "London", uk: "London", england: "London",
+    "united states": "Washington, D.C.", usa: "Washington, D.C.",
+    "united states of america": "Washington, D.C.", uruguay: "Montevideo",
+    uzbekistan: "Tashkent", venezuela: "Caracas", vietnam: "Hanoi", yemen: "Sanaa",
+    zambia: "Lusaka", zimbabwe: "Harare",
+  };
+
+  const SYMBOLS = {
+    hydrogen: "H", helium: "He", lithium: "Li", beryllium: "Be", boron: "B",
+    carbon: "C", nitrogen: "N", oxygen: "O", fluorine: "F", neon: "Ne",
+    sodium: "Na", magnesium: "Mg", aluminium: "Al", aluminum: "Al", silicon: "Si",
+    phosphorus: "P", sulfur: "S", sulphur: "S", chlorine: "Cl", argon: "Ar",
+    potassium: "K", calcium: "Ca", scandium: "Sc", titanium: "Ti", vanadium: "V",
+    chromium: "Cr", manganese: "Mn", iron: "Fe", cobalt: "Co", nickel: "Ni",
+    copper: "Cu", zinc: "Zn", silver: "Ag", tin: "Sn", gold: "Au", mercury: "Hg",
+    lead: "Pb", uranium: "U",
+  };
+
+  function factKey(s) {
+    return String(s).toLowerCase().replace(/[?.!,]/g, "").replace(/^the\s+/, "").trim();
+  }
+
+  /* ------------------------------------------------------------- chat ----- */
+  /* Deterministic conversation. No model: a small set of intents, a stable
+   * hash to choose among hand-written responses. The default voice is a
+   * practical assistant. Emotional language is met with care, but ordinary
+   * greetings and unknown input do not turn into a therapy session. */
+  function seedOf(s) {
+    let h = 2166136261;
+    const t = String(s || "");
+    for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return (h >>> 0);
+  }
+
+  function pick(list, seed) {
+    return list[((seed % list.length) + list.length) % list.length];
+  }
+
+  const FEELINGS = [
+    [/\b(anxious|anxiety|panic|nervous|worried|worry)\b/i, "anxious", "the worry is loud right now"],
+    [/\b(sad|down|depressed|low|blue|empty)\b/i, "sad", "something feels heavy"],
+    [/\b(angry|mad|furious|irritated|annoyed)\b/i, "angry", "something crossed a line"],
+    [/\b(stressed|overwhelmed|overloaded|buried|swamped)\b/i, "overwhelmed", "there is more than fits"],
+    [/\b(tired|exhausted|drained|burnt out|burned out)\b/i, "tired", "the tank is low"],
+    [/\b(lonely|alone|isolated)\b/i, "lonely", "the quiet is doing the talking"],
+    [/\b(scared|afraid|fear)\b/i, "afraid", "the future is showing its teeth"],
+    [/\b(confused|lost|stuck|uncertain)\b/i, "stuck", "the next step is not visible"],
+  ];
+
+  function chatReply(step, ctx) {
+    const raw = String(step || "").trim();
+    const q = raw.toLowerCase().replace(/\s+/g, " ");
+    if (!q) return "";
+    // Command-shaped text should fail as a command, not get a reflection.
+    if (/^(?:read|list|write|delete|remove|open|show|run|convert|calculate|calc|count|find|search|define|summarize|build|make|create|plan|blueprint|new|rename|multiply|divide|add|subtract|square|uppercase|lowercase|reverse|hash|encode|decode)\b/.test(q)) {
+      return "";
+    }
+    const seed = seedOf(q);
+    const mem = (ctx && ctx.memory) || { get: function () {}, set: function () {} };
+    const name = mem.get("name");
+
+    let m = /(?:my name is|call me|remember my name is)\s+([a-z][a-z'\-]{1,24})/i.exec(raw);
+    if (m) {
+      const who = m[1].replace(/^./, function (c) { return c.toUpperCase(); });
+      mem.set("name", who);
+      return "Noted — " + who + ". I'll use that.\n\nWhat are you working on today?";
+    }
+    if (/^(?:what(?:'s| is) my name|who am i|do you remember my name)\??$/i.test(q)) {
+      return name ? "You told me your name is " + name + "." : "You haven't told me a name yet. Say: remember my name is …";
+    }
+
+    if (/^(?:hi|hello|hey|yo|hiya|hola|salut|bonjour|hallo|namaste|नमस्ते|नमस्कार|こんにちは|こんばんは|good (?:morning|afternoon|evening))(?=$|\s|[,.!?])/.test(q)) {
+      const code = replyLang();
+      if (code !== "en") {
+        const greeting = shellSay("greeting", code);
+        if (greeting) return greeting;
+      }
+      return pick([
+        "Hey" + (name ? ", " + name : "") + ". What are we building?",
+        "Hi. Want to build something, run a tool, or look something up?",
+        "Hello. What do you want to make today?",
+      ], seed);
+    }
+    if (/\b(thanks|thank you|thx|appreciate it)\b/.test(q)) {
+      return pick(["You're welcome. Want to keep going?", "Any time. What's next?", "Glad it helped."], seed);
+    }
+    if (/^(?:got it|cool|nice|perfect|great|sounds good|ok thanks|nice one|well done|good job|that works|makes sense)(?:[.!]+)?$/i.test(q)) {
+      return pick(["Good. What's next?", "Got it. Give me the next command when you're ready.", "Okay. Want to build something or run a tool?"], seed);
+    }
+    if (/^(?:bye|goodbye|see you|later|good night)\b/.test(q)) {
+      return pick(["See you. Your workspace stays here.", "Later. The project is saved in this browser.", "Good night. Pick it up whenever."], seed);
+    }
+    if (/\bhow are you\b/.test(q)) {
+      return "Running steady and ready to work. What are you making?";
+    }
+    if (/\b(tell me a joke|make me laugh|something funny)\b/.test(q)) {
+      return pick([
+        "A router walks into a bar. The bartender asks what it wants. It says: \"I already knew.\"",
+        "Why did the function stop calling? It lost its reference.",
+        "There are two hard things in computing: naming things, cache invalidation, and off-by-one errors.",
+        "I tried to write a joke about recursion. I'll tell you the rest when I get there.",
+      ], seed);
+    }
+    if (/\b(motivate me|i need motivation|encourage me|pep talk)\b/.test(q)) {
+      return pick([
+        "Pick the next small action and do it badly on purpose. Momentum beats a perfect plan.",
+        "Start with something you can finish in ten minutes. Then start the next thing.",
+        "The work is allowed to be small. Small things, repeated, become the thing.",
+      ], seed);
+    }
+    if (/\b(who are you|what are you|tell me about yourself)\b/.test(q)) {
+      return "I'm toolrx — a deterministic router and a small builder. I match patterns, run real tools, write project files, and I can look things up on the web.\n\nI'm not an LLM. That means I won't invent an answer: if I don't know, I'll say so.";
+    }
+    if (/\b(what should i (?:build|make)|give me an idea|project idea)\b/.test(q)) {
+      return pick([
+        "Build a tiny tool you would actually use twice: a unit converter, a shift timer, a packing list.",
+        "Build the smallest game you can lose: snake, pong, or a one-screen maze.",
+        "Build a page that explains one idea well. Architecture first, decoration second.",
+      ], seed) + "\n\nSay \"plan it\" and I'll lay out the files, state, modules, and build order.";
+    }
+    if (/\b(are you (?:real|alive|sentient|conscious)|do you have feelings)\b/.test(q)) {
+      return "No. I'm a pattern matcher with a workspace. The care in the words is real in the sense that it's written carefully — but there's nobody home behind them.";
+    }
+    if (/\b(suicide|kill myself|self[- ]harm|hurt myself|end my life|want to die)\b/i.test(q)) {
+      return "I'm really sorry you're carrying that. I'm not a crisis service and I can't keep you safe from here.\n\nPlease reach out to a local emergency number or a crisis line right now, and if you can, tell one person nearby that you're not okay. If you're in the US, call or text 988. In the UK, 116 123. Elsewhere: findahelpline.com.\n\nI'm still here if you want to keep talking, but please put a human in the loop first.";
+    }
+
+    for (let i = 0; i < FEELINGS.length; i++) {
+      if (FEELINGS[i][0].test(q)) {
+        const label = FEELINGS[i][1];
+        const image = FEELINGS[i][2];
+        const openers = [
+          "That sounds " + label + " — " + image + ".",
+          "I hear " + label + ". " + image.charAt(0).toUpperCase() + image.slice(1) + ".",
+          "So there's " + label + " in the room. " + image.charAt(0).toUpperCase() + image.slice(1) + ".",
+        ];
+        const follows = [
+          "What part of it is loudest right now?",
+          "If it had a shape, what would it look like?",
+          "What would 'a little better' look like today — not fixed, just a little better?",
+          "Is there one thing you can put down for an hour?",
+        ];
+        return pick(openers, seed) + "\n\n" + pick(follows, seed >> 3);
+      }
+    }
+
+    m = /^(?:i (?:feel|am|'m)\s+)(.{2,80})$/i.exec(raw);
+    if (m && !/^(?:going|trying|working|building|making|okay|ok|fine|good|great)\b/i.test(m[1])) {
+      return "You said you feel " + m[1].replace(/[.!?]+$/, "") + ".\n\n"
+        + pick(["What's the loudest part of it right now?",
+                "Do you want to talk it through, or work on something small for a break?",
+                "What would a little relief look like today?"], seed);
+    }
+    if (/\b(i (?:can'?t|cannot)|i'?m stuck|i don'?t know (?:what|how))\b/i.test(q)) {
+      return "Stuck usually means the next step is too big.\n\nName the smallest piece you can finish — even if it's opening the file — and we'll start there.";
+    }
+    if (/\b(i (?:want|need) to|i should|i have to)\b/i.test(q)) {
+      return "Give me the concrete action and I'll try to run it. For example: \"build a budget app\", \"convert 5 km to miles\", or \"list projects\".\n\nIf it isn't in the command library, I'll say so instead of guessing.";
+    }
+    if (/^(?:why|really|and|so)\??$/.test(q) && ctx && ctx.history) {
+      const hist = ctx.history().filter(function (x) { return x.who === "toolrx"; });
+      if (hist.length) return "I don't have more context than my last reply. Tell me which part to expand, or give me a command to run.";
+    }
+    if (/\b(i'?m (?:okay|ok|fine|good|great|alright))\b/i.test(q)) {
+      return "Good. Want to build something or run a tool?";
+    }
+    if (/\b(help|support|listen)\b/.test(q) && q.split(" ").length <= 4) {
+      return "I can run tools, build projects, and look things up. If you want to talk something through, say what's going on. If you want output, try: \"i feel overwhelmed\" · \"plan a todo app\" · \"wikipedia ursula k le guin\" · \"list projects\".";
+    }
+
+    // Unknown input gets a practical answer, not a reflection prompt.
+    const echo = raw.length > 140 ? raw.slice(0, 137) + "..." : raw;
+    return "I don't have a matching command for \"" + echo + "\".\n\n"
+      + pick([
+        "I can build a page or game, run a calculation, search the web, or manage projects. Try: \"build a snake game\" or \"wikipedia ursula k le guin\".",
+        "Give me a build, a tool, a lookup, or a project command and I'll run it. \"help\" lists the categories.",
+        "That one isn't in the library yet. Try \"plan a todo app\", \"convert 5 km to miles\", or \"list projects\".",
+      ], seed);
+  }
+
+  function summarizeText(text, n) {
+    const src = String(text || "").replace(/\s+/g, " ").trim();
+    if (!src) return "nothing to summarize";
+    const parts = src.match(/[^.!?]+[.!?]+/g) || [src];
+    const take = parts.slice(0, n || 3).join(" ").trim();
+    const words = src.split(/\s+/).filter(Boolean).length;
+    return take + "\n\n(" + words + " words, " + parts.length + " sentences)";
+  }
+
+  /* Deterministic extractors. They read the previous step by default, so
+   * "wikipedia ada lovelace then extract headings" and "outline it" work
+   * without a model. Output is stable: same input, same lines. */
+  function headingsOf(text) {
+    const lines = String(text == null ? "" : text).replace(/\r/g, "").split("\n");
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      let m = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
+      if (m) {
+        out.push({ level: m[1].length, text: m[2].replace(/\s+/g, " ").trim() });
+        continue;
+      }
+      m = /^\s*<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>\s*$/i.exec(line);
+      if (m) {
+        out.push({ level: Number(m[1]),
+          text: m[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim() });
+        continue;
+      }
+      const next = lines[i + 1] || "";
+      if (line.trim() && /^\s*(=+|-+)\s*$/.test(next)) {
+        out.push({ level: next.trim().charAt(0) === "=" ? 1 : 2,
+          text: line.replace(/\s+/g, " ").trim() });
+        i++;
+      }
+    }
+    return out;
+  }
+
+  function outlineOf(text) {
+    const headings = headingsOf(text);
+    if (!headings.length) return "(no headings found)";
+    return headings.map(function (h) {
+      return "  ".repeat(Math.max(0, h.level - 1)) + "- " + h.text;
+    }).join("\n");
+  }
+
+  function firstLines(text, n) {
+    const count = Math.max(1, Math.min(200, Math.trunc(num(n)) || 5));
+    const lines = String(text == null ? "" : text).replace(/\r/g, "").split("\n");
+    return lines.slice(0, count).join("\n");
+  }
+
+  function tableOf(text) {
+    const lines = String(text == null ? "" : text).replace(/\r/g, "")
+      .split("\n").filter(function (line) { return line.trim(); });
+    if (!lines.length) return "(no rows)";
+    // An existing markdown table is already the format we would produce.
+    if (lines.every(function (line) { return line.indexOf("|") !== -1; })) {
+      return lines.join("\n");
+    }
+    const delim = lines[0].indexOf("\t") !== -1 ? "\t"
+      : (lines[0].indexOf(",") !== -1 ? "," : /\s{2,}/);
+    const rows = lines.map(function (line) {
+      return line.split(delim).map(function (cell) { return cell.trim(); });
+    });
+    const width = rows.reduce(function (n, row) {
+      return Math.max(n, row.length);
+    }, 0);
+    rows.forEach(function (row) {
+      while (row.length < width) row.push("");
+    });
+    const esc = function (cell) { return String(cell).replace(/\|/g, "\\|"); };
+    const out = ["| " + rows[0].map(esc).join(" | ") + " |",
+      "| " + rows[0].map(function () { return "---"; }).join(" | ") + " |"];
+    for (let i = 1; i < rows.length; i++) {
+      out.push("| " + rows[i].map(esc).join(" | ") + " |");
+    }
+    return out.join("\n");
+  }
+
+  /* ------------------------------------------------------- extractors ---- */
+  /* Step 44. Each extractor reads a literal, a file path, or the previous
+   * step, in that order (resolveText), then applies the same two named caps:
+   * extractChars on the input and extractItems on the output. Order is the
+   * source order; nothing is ranked by a model. */
+  function extractorInput(v, ctx) {
+    const text = resolveText(v, ctx);
+    const max = LIMITS_RAW.extractChars;
+    if (text.length <= max) return { text: text, total: text.length, cut: 0 };
+    return { text: text.slice(0, max), total: text.length, cut: text.length };
+  }
+
+  function extractorNote(got) {
+    if (!got.cut) return "";
+    return "\n(input truncated at " + LIMITS_RAW.extractChars
+      + " of " + got.total + " chars)";
+  }
+
+  function capItems(lines, what) {
+    const max = LIMITS_RAW.extractItems;
+    if (lines.length <= max) return lines;
+    return lines.slice(0, max).concat(
+      "(showing first " + max + " of " + lines.length + " " + what + ")");
+  }
+
+  function extractorResult(got, lines, what, empty) {
+    if (!got.text.trim()) return "nothing to extract — the text is empty";
+    if (!lines.length) return empty;
+    return capItems(lines, what).join("\n") + extractorNote(got);
+  }
+
+  function listItemsOf(text) {
+    const out = [];
+    String(text == null ? "" : text).replace(/\r/g, "").split("\n")
+      .forEach(function (line) {
+        const m = /^\s{0,6}(?:[-*+]|\d{1,3}[.)])\s+(?:\[[ xX]\]\s+)?(.+?)\s*$/.exec(line);
+        if (m && m[1]) out.push(m[1]);
+      });
+    return out;
+  }
+
+  function keyFactsOf(text) {
+    const out = [];
+    const seen = {};
+    String(text == null ? "" : text).replace(/\r/g, "").split(/\n{2,}/)
+      .forEach(function (block) {
+        const body = block.trim();
+        if (!body) return;
+        // Fenced code, tables, and heading-only blocks are structure, not facts.
+        if (/^```/.test(body) || /^\|/.test(body)) return;
+        const prose = body.split("\n")
+          .filter(function (line) { return !/^\s{0,3}#{1,6}\s/.test(line); })
+          .join("\n").trim();
+        if (!prose) return;
+        if (/^(?:[-*+]|\d{1,3}[.)])\s+/.test(prose)) return;
+        const first = prose.match(/[^.!?]+[.!?]+/);
+        const line = (first ? first[0] : prose.split("\n")[0])
+          .replace(/\s+/g, " ").trim();
+        if (!line || seen[line]) return;
+        seen[line] = true;
+        out.push("- " + line);
+      });
+    return out;
+  }
+
+  function codeOutlineOf(text) {
+    const out = [];
+    const seen = {};
+    const push = function (kind, name) {
+      const line = kind + " " + name;
+      if (seen[line]) return;
+      seen[line] = true;
+      out.push(line);
+    };
+    String(text == null ? "" : text).replace(/\r/g, "").split("\n")
+      .forEach(function (line) {
+        let m = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/.exec(line);
+        if (m) return push("function", m[1]);
+        m = /^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/.exec(line);
+        if (m) return push("class", m[1]);
+        m = /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/.exec(line);
+        if (m) return push("const", m[1]);
+        m = /^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)/.exec(line);
+        if (m) return push("def", m[1]);
+      });
+    return out;
+  }
+
+  function diffSide(text) {
+    let t = String(text == null ? "" : text).replace(/\r\n?/g, "\n");
+    if (t.charAt(t.length - 1) === "\n") t = t.slice(0, -1);
+    return t === "" ? [] : t.split("\n");
+  }
+
+  /* Longest common subsequence over lines, with the common prefix and suffix
+   * trimmed first. Deterministic tie-break: prefer the deletion, so the same
+   * pair always produces the same op order. */
+  function lineDiff(a, b) {
+    let start = 0;
+    while (start < a.length && start < b.length && a[start] === b[start]) start++;
+    let endA = a.length, endB = b.length;
+    while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+      endA--; endB--;
+    }
+    const A = a.slice(start, endA), B = b.slice(start, endB);
+    const n = A.length, m = B.length;
+    const dp = new Int32Array((n + 1) * (m + 1));
+    const at = function (i, j) { return i * (m + 1) + j; };
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) {
+        dp[at(i, j)] = A[i] === B[j]
+          ? dp[at(i + 1, j + 1)] + 1
+          : Math.max(dp[at(i + 1, j)], dp[at(i, j + 1)]);
+      }
+    }
+    const ops = [];
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+      if (A[i] === B[j]) { ops.push({ t: "=", v: A[i] }); i++; j++; }
+      else if (dp[at(i + 1, j)] >= dp[at(i, j + 1)]) {
+        ops.push({ t: "-", v: A[i] }); i++;
+      } else { ops.push({ t: "+", v: B[j] }); j++; }
+    }
+    while (i < n) ops.push({ t: "-", v: A[i++] });
+    while (j < m) ops.push({ t: "+", v: B[j++] });
+    return ops;
+  }
+
+  function diffSummaryOf(leftText, rightText) {
+    const left = diffSide(leftText), right = diffSide(rightText);
+    if (!left.length && !right.length) return "nothing to diff — both sides are empty";
+    if (!left.length) return "nothing to diff — the left side is empty";
+    if (!right.length) return "nothing to diff — the right side is empty";
+    const cap = LIMITS_RAW.diffLines;
+    if (left.length > cap || right.length > cap) {
+      const side = left.length > cap ? "left" : "right";
+      const n = Math.max(left.length, right.length);
+      throw new Error("the diff is capped at " + cap + " lines per side ("
+        + side + " has " + n + ")");
+    }
+    const diff = lineDiff(left, right);
+    const added = diff.filter(function (o) { return o.t === "+"; }).length;
+    const removed = diff.filter(function (o) { return o.t === "-"; }).length;
+    const unchanged = left.length - removed;
+    if (!added && !removed) {
+      return "no changes · " + unchanged + " line"
+        + (unchanged === 1 ? "" : "s") + " identical";
+    }
+    const changed = diff.filter(function (o) { return o.t !== "="; })
+      .map(function (o) { return o.t + " " + o.v; });
+    const body = capItems(changed, "changed lines");
+    return ["diff · " + added + " added · " + removed + " removed · "
+      + unchanged + " unchanged"].concat(body).join("\n");
+  }
+
+  /* ------------------------------------------------------------ memory ---- */
+  function memoryStore(ctx) {
+    const m = ctx && ctx.memory;
+    return m && typeof m.get === "function" && typeof m.set === "function" ? m : null;
+  }
+
+  function factKey(s) {
+    return String(s || "").toLowerCase()
+      .replace(/^(?:that|the|my)\s+/, "")
+      .replace(/[?!.]+$/g, "")
+      .replace(/\s+/g, " ").trim().slice(0, 60);
+  }
+
+  function factMap(ctx) {
+    const mem = memoryStore(ctx);
+    const raw = mem ? mem.get("facts") : null;
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  }
+
+  function noteList(ctx) {
+    const mem = memoryStore(ctx);
+    const raw = mem ? mem.get("notes") : null;
+    return Array.isArray(raw) ? raw : [];
+  }
+
+  function prettyValue(s) {
+    const v = String(s || "").trim().slice(0, 200);
+    return v;
+  }
+
+  function memoryRemember(args, ctx) {
+    const mem = memoryStore(ctx);
+    if (!mem) throw new Error("memory is not available here");
+    const key = factKey(args.key);
+    const value = prettyValue(args.value);
+    if (!key || !value) throw new Error("say what to remember — e.g. remember my favorite color is teal");
+    const facts = Object.assign({}, factMap(ctx));
+    facts[key] = value;
+    if (key === "name") mem.set("name", value.replace(/^./, function (c) { return c.toUpperCase(); }));
+    mem.set("facts", facts);
+    journalAdd(ctx, {
+      kind: "preference", topic: key, text: value, source: "memory.remember",
+      n: conversationState(ctx).turnsSeen || 0,
+    });
+    const shown = key === "name" ? mem.get("name") : value;
+    return "Noted — " + key + ": " + shown + ".\n\nAsk me later: what is my " + key + "?";
+  }
+
+  function memoryNote(args, ctx) {
+    const mem = memoryStore(ctx);
+    if (!mem) throw new Error("memory is not available here");
+    const text = prettyValue(args.text);
+    if (!text) throw new Error("say what to note down");
+    const notes = noteList(ctx).slice(-19);
+    notes.push({ text: text, at: Date.now() });
+    mem.set("notes", notes);
+    return "Noted: \"" + text + "\" · " + notes.length + " note" + (notes.length === 1 ? "" : "s") + " saved";
+  }
+
+  function memoryRecall(args, ctx) {
+    const key = factKey(args.key);
+    if (!key) throw new Error("say what to recall");
+    const facts = factMap(ctx);
+    const mem = memoryStore(ctx);
+    if (key === "name" && mem && mem.get("name")) {
+      return "Your name is " + mem.get("name") + ".";
+    }
+    if (Object.prototype.hasOwnProperty.call(facts, key)) {
+      return "Your " + key + " is " + facts[key] + ".";
+    }
+    return "I don't have anything saved for \"" + key + "\". Say: remember my " + key + " is …";
+  }
+
+  function memoryList(args, ctx) {
+    const mem = memoryStore(ctx);
+    const facts = factMap(ctx);
+    const notes = noteList(ctx);
+    const name = mem ? mem.get("name") : "";
+    const last = mem ? mem.get("last_build") : null;
+    const lines = [];
+    if (name) lines.push("name: " + name);
+    Object.keys(facts).sort().forEach(function (k) {
+      if (k === "name" && name) return;
+      lines.push(k + ": " + facts[k]);
+    });
+    notes.forEach(function (n, i) { lines.push("note " + (i + 1) + ": " + n.text); });
+    if (last && last.title) {
+      lines.push("last build: " + last.title + (last.slug ? " → projects/" + last.slug : "")
+        + (last.kind ? " (" + last.kind + ")" : ""));
+    }
+    if (!lines.length) {
+      return "I don't have anything saved yet.\n\nTry: remember my favorite color is teal · "
+        + "remember my dog is called Max · what do you remember";
+    }
+    return "Here is what I have saved:\n\n" + lines.join("\n");
+  }
+
+  function memoryForget(args, ctx) {
+    const mem = memoryStore(ctx);
+    if (!mem) throw new Error("memory is not available here");
+    const key = factKey(args.key);
+    if (!key || key === "everything" || key === "all") {
+      mem.set("facts", {});
+      mem.set("notes", []);
+      mem.set("name", "");
+      mem.set("last_build", "");
+      if (typeof mem.clear === "function") mem.clear();
+      return "memory cleared · projects and files are untouched";
+    }
+    const facts = Object.assign({}, factMap(ctx));
+    let removed = false;
+    if (Object.prototype.hasOwnProperty.call(facts, key)) {
+      delete facts[key];
+      removed = true;
+    }
+    if (key === "name" && mem.get("name")) {
+      mem.set("name", "");
+      removed = true;
+    }
+    mem.set("facts", facts);
+    return removed ? "forgot \"" + key + "\"" : "I didn't have anything saved for \"" + key + "\"";
+  }
+
+  function memoryContext(args, ctx) {
+    const mem = memoryStore(ctx);
+    const lines = [];
+    const last = mem ? mem.get("last_build") : null;
+    if (last && last.title) {
+      lines.push("last build: " + last.title + (last.slug ? " → projects/" + last.slug : "")
+        + (last.kind ? " (" + last.kind + ")" : "")
+        + (last.desc ? " · " + last.desc : ""));
+    }
+    const project = ctx && ctx.project && typeof ctx.project.active === "function"
+      ? ctx.project.active() : null;
+    if (project) {
+      const count = project.files ? Object.keys(project.files).length : 0;
+      lines.push("active project: " + project.name + " (" + project.slug + ")" + (count ? " · " + count + " files" : ""));
+    }
+    const name = mem ? mem.get("name") : "";
+    if (name) lines.push("name: " + name);
+    if (!lines.length) {
+      return "No active project or saved context yet.\n\nTry: build a todo list · new project notes · remember my name is Ada";
+    }
+    return "Here is where you left off:\n\n" + lines.join("\n");
+  }
+
+  /* -------------------------------------------------------------- journal ---- */
+  /* Step 56: a per-project decision journal, separate from the short
+   * conversation memory. The pure module owns storage and caps; these helpers
+   * only resolve the active project and shape the answer. */
+  function journalModule() { return root.toolrxJournal || null; }
+
+  function journalSlug(ctx) {
+    const p = ctx && ctx.project && typeof ctx.project.active === "function"
+      ? ctx.project.active() : null;
+    return (p && p.slug) || "scratch";
+  }
+
+  function journalAdd(ctx, entry) {
+    const J = journalModule();
+    if (!J) return null;
+    return J.add(journalSlug(ctx), entry);
+  }
+
+  function journalShow(ctx) {
+    const J = journalModule();
+    if (!J) throw new Error("the journal module is not loaded");
+    return J.text(journalSlug(ctx));
+  }
+
+  function journalQuery(a, ctx) {
+    const J = journalModule();
+    if (!J) throw new Error("the journal module is not loaded");
+    const topic = String((a && a.topic) || "").trim();
+    return topic ? J.answer(journalSlug(ctx), topic) : J.text(journalSlug(ctx));
+  }
+
+  function journalClear(ctx) {
+    const J = journalModule();
+    if (!J) throw new Error("the journal module is not loaded");
+    J.clear(journalSlug(ctx));
+    return "journal cleared · files, plan, context, and conversation are untouched";
+  }
+
+  /* ---------------------------------------------------------- workspace ---- */
+  /* Step 64: cross-project answers read the derived index, never another
+   * project's context. The sandbox builds the state; this module only renders
+   * the bounded result. */
+  function workspaceModule() { return root.toolrxWorkspace || null; }
+
+  function workspaceRender(kind, args, ctx) {
+    const W = workspaceModule();
+    if (!W) throw new Error("the workspace module is not loaded");
+    const state = ctx && typeof ctx.workspace === "function"
+      ? ctx.workspace() : null;
+    return W.render(kind, state || { projects: [] }, args || {});
+  }
+
+  /* ------------------------------------------------------- conversation ---- */
+  /* Step 47. Short replies are exact catalog routes, but they need the previous
+   * turn. The state lives beside facts and notes in the same small memory
+   * object, capped by limits.json, and is inspectable with "show conversation".
+   * A correction either revises the last action, stages one build for a yes/no,
+   * or asks one bounded question. A confirmation only runs the staged action
+   * once; it never re-runs the previous build. */
+  const CONV_KEY = "conversation";
+  const CONV_VERSION = 1;
+
+  function conversationStore(ctx) {
+    return memoryStore(ctx);
+  }
+
+  function conversationState(ctx) {
+    const mem = conversationStore(ctx);
+    const raw = mem ? mem.get(CONV_KEY) : null;
+    if (!raw || typeof raw !== "object" || raw.version !== CONV_VERSION) {
+      return { version: CONV_VERSION, turns: [], last: null, pending: null,
+               dropped: 0, turnsSeen: 0 };
+    }
+    return {
+      version: CONV_VERSION,
+      turns: Array.isArray(raw.turns) ? raw.turns.slice() : [],
+      last: raw.last && typeof raw.last === "object" ? raw.last : null,
+      pending: raw.pending && typeof raw.pending === "object" ? raw.pending : null,
+      dropped: Number(raw.dropped) || 0,
+      turnsSeen: Number(raw.turnsSeen) || 0,
+    };
+  }
+
+  function conversationSave(ctx, state) {
+    const mem = conversationStore(ctx);
+    if (!mem) return state;
+    const maxTurns = LIMITS_RAW.conversationTurns;
+    const maxBytes = LIMITS_RAW.conversationBytes;
+    const next = {
+      version: CONV_VERSION,
+      turns: state.turns.slice(),
+      last: state.last || null,
+      pending: state.pending || null,
+      dropped: Number(state.dropped) || 0,
+      turnsSeen: Number(state.turnsSeen) || 0,
+    };
+    while (next.turns.length > maxTurns) {
+      next.turns.shift();
+      next.dropped++;
+    }
+    // Drop the oldest turns first until the serialized state fits. The current
+    // turn and any pending action are kept; only their text is trimmed if a
+    // single entry is larger than the whole cap.
+    while (next.turns.length > 1
+           && byteLength(JSON.stringify(next)) > maxBytes) {
+      next.turns.shift();
+      next.dropped++;
+    }
+    if (byteLength(JSON.stringify(next)) > maxBytes) {
+      if (next.last) {
+        next.last.text = String(next.last.text || "").slice(0, 240);
+        next.last.result = String(next.last.result || "").slice(0, 240);
+        if (Array.isArray(next.last.steps)) {
+          next.last.steps = next.last.steps.slice(0, 4).map(function (s) {
+            return { text: String(s.text || "").slice(0, 120), via: s.via || "" };
+          });
+        }
+      }
+      if (next.pending) {
+        next.pending.text = String(next.pending.text || "").slice(0, 240);
+      }
+      while (next.turns.length > 1
+             && byteLength(JSON.stringify(next)) > maxBytes) {
+        next.turns.shift();
+        next.dropped++;
+      }
+    }
+    mem.set(CONV_KEY, next);
+    return next;
+  }
+
+  function conversationRecord(ctx, query, results, opts) {
+    if (opts && opts.skip) return;
+    const list = Array.isArray(results) ? results : [];
+    const last = list[list.length - 1] || {};
+    // Inspection is read-only: recording the show turn after rendering would
+    // evict a turn and make the printed counts disagree with the stored state.
+    if (String(last.via || "") === "conversation.show") return;
+    const state = conversationState(ctx);
+    state.turnsSeen = (state.turnsSeen || 0) + 1;
+    state.turns.push({
+      you: String(query).slice(0, LIMITS_RAW.singleChars),
+      via: String(last.via || ""),
+      text: String(last.text || "").slice(0, 400),
+      error: !!last.error,
+      n: state.turnsSeen,
+    });
+    // Inspection, repair questions, acknowledgements, and staged proposals are
+    // turns, but they are not actions. Keep `last` on the last real command so
+    // a later correction still revises what the user actually ran.
+    const actions = list.filter(function (r) {
+      const via = String(r.via || "");
+      return via && via !== "chat" && via.indexOf("conversation.") !== 0
+        && !/^macro\.(?:preview|edit|list)$/.test(via);
+    });
+    if (actions.length) {
+      const action = actions[actions.length - 1];
+      const actionText = String((opts && opts.actionText) || query);
+      state.last = {
+        text: actionText.slice(0, LIMITS_RAW.singleChars),
+        steps: actions.map(function (r) {
+          return { text: String(r.step || "").slice(0, 240),
+                   via: String(r.via || "") };
+        }),
+        via: String(action.via || ""),
+        result: String(action.text || "").slice(0, 400),
+        error: !!action.error,
+        n: state.turnsSeen,
+      };
+    }
+    // A normal command means the user moved on. A staged correction is the
+    // exception: its reply is recorded with keepPending so "yes" can find it.
+    if (!(opts && opts.keepPending)) {
+      if (state.pending && state.pending.kind === "macro") clearMacro(ctx);
+      state.pending = null;
+    }
+    if (!(opts && opts.keepRepair)
+        && String(last.via || "").indexOf("repair.") !== 0) {
+      clearRepair(ctx);
+    }
+    conversationSave(ctx, state);
+  }
+
+  function conversationText(ctx) {
+    const state = conversationState(ctx);
+    const stored = byteLength(JSON.stringify(state));
+    const lines = [
+      "conversation · " + state.turns.length + " turn"
+        + (state.turns.length === 1 ? "" : "s") + " stored",
+      "cap " + LIMITS_RAW.conversationTurns + " turns · "
+        + LIMITS_RAW.conversationBytes + " bytes",
+      "stored " + stored + " bytes · dropped " + state.dropped,
+    ];
+    lines.push(state.last
+      ? "last: " + state.last.text + " · via " + (state.last.via || "?")
+      : "last: none");
+    if (!state.pending) {
+      lines.push("pending: none");
+    } else if (state.pending.kind === "action") {
+      lines.push("pending: " + state.pending.text
+        + " · say yes to run it once or no to cancel");
+    } else if (state.pending.kind === "variant") {
+      const variant = readVariant(ctx);
+      lines.push("pending: compacted plan " + state.pending.text
+        + (variant ? " · " + variant.steps.length + " steps" : " · no longer stored")
+        + " · say yes to run it, no to cancel, or send an edited request");
+    } else if (state.pending.kind === "repair") {
+      const doc = readRepair(ctx);
+      lines.push("pending: repair plan " + state.pending.text
+        + (doc ? " · " + doc.steps.length + " steps · pass "
+          + doc.passes + " of " + doc.maxPasses : " · no longer stored")
+        + " · say yes to run it, no to cancel, or send an edited request");
+    } else if (state.pending.kind === "macro") {
+      const doc = readMacro(ctx);
+      lines.push("pending: macro plan " + state.pending.text
+        + (doc ? " · " + doc.steps.length + " steps"
+          + (doc.edited ? " · edited" : "") : " · no longer stored")
+        + " · say yes to run it, no to cancel, or edit the macro plan to change the list");
+    } else {
+      lines.push("pending: needs " + state.pending.need);
+    }
+    if (!state.turns.length) lines.push("(no turns yet)");
+    state.turns.forEach(function (t, i) {
+      lines.push("  " + (i + 1) + ". you: " + t.you + " → "
+        + (t.via || "?") + (t.error ? " (error)" : ""));
+    });
+    return lines.join("\n");
+  }
+
+  function conversationClear(ctx) {
+    const mem = conversationStore(ctx);
+    if (mem) {
+      mem.set(CONV_KEY, { version: CONV_VERSION, turns: [], last: null,
+                          pending: null, dropped: 0, turnsSeen: 0 });
+    }
+    return "conversation cleared · memory facts, notes, projects, and context are untouched";
+  }
+
+  /* -------------------------------------------------------------- macros ---- */
+  /* Step 67: a named macro expands literally into steps. The table travels in
+   * commands.json (built from toolrx/macros.json) and the pure expander is
+   * web/macros.js. A preview stages the exact list beside conversation memory
+   * so the user can edit it without changing the macro. */
+  const MACRO_KEY = "macroPlan";
+  const MACRO_VERSION = 1;
+
+  function macroModule() { return root.toolrxMacros || null; }
+
+  function macroLimits() {
+    return { steps: LIMITS.steps, chars: LIMITS.plan, single: LIMITS.single };
+  }
+
+  function macroExpand(name) {
+    const M = macroModule();
+    if (!M) throw new Error("the macro module is not loaded");
+    return M.expand(MACROS, name, macroLimits());
+  }
+
+  function macroHeader(result) {
+    const steps = (result.steps || []).map(function (step) {
+      return String(step);
+    });
+    const total = result.total == null ? steps.length : result.total;
+    const lines = [
+      "macro · " + result.name + " · " + total + " steps · r.macro-run",
+    ];
+    steps.forEach(function (step, i) {
+      lines.push("  " + (i + 1) + ". " + step);
+    });
+    return lines.join("\n");
+  }
+
+  function readMacro(ctx) {
+    const mem = memoryStore(ctx);
+    const raw = mem ? mem.get(MACRO_KEY) : null;
+    if (!raw || typeof raw !== "object" || raw.version !== MACRO_VERSION
+        || !Array.isArray(raw.steps)) return null;
+    return raw;
+  }
+
+  function stageMacro(ctx, result, steps, edited) {
+    const mem = memoryStore(ctx);
+    if (!mem) return null;
+    const clean = (steps || []).map(function (step) { return String(step); });
+    const record = {
+      version: MACRO_VERSION,
+      name: String(result.name),
+      summary: String(result.summary || ""),
+      steps: clean,
+      original: result.steps.map(function (step) { return String(step); }),
+      edited: !!edited,
+    };
+    if (byteLength(JSON.stringify(record)) > LIMITS_RAW.planVariantBytes) {
+      return null;
+    }
+    mem.set(MACRO_KEY, record);
+    return record;
+  }
+
+  function clearMacro(ctx) {
+    const mem = memoryStore(ctx);
+    if (mem) mem.set(MACRO_KEY, null);
+  }
+
+  function stagePendingMacro(ctx, name) {
+    const state = conversationState(ctx);
+    state.pending = {
+      kind: "macro",
+      text: String(name || "macro"),
+      n: (state.turnsSeen || 0) + 1,
+    };
+    conversationSave(ctx, state);
+  }
+
+  function macroPreviewRun(name, ctx) {
+    const M = macroModule();
+    const result = macroExpand(name);
+    if (!result.ok) {
+      return { step: "preview macro " + name,
+               text: M.previewText(result, macroLimits()),
+               via: "macro.preview", error: true, planLength: 1 };
+    }
+    const record = stageMacro(ctx, result, result.steps, false);
+    if (!record) {
+      return {
+        step: "preview macro " + name, via: "macro.preview", error: true,
+        planLength: 1,
+        text: "macro · " + result.name + " · refused · r.macro-store\n"
+          + "the expanded plan is larger than planVariantBytes ("
+          + LIMITS_RAW.planVariantBytes + " bytes); nothing was staged · r.macro-store",
+      };
+    }
+    stagePendingMacro(ctx, result.name);
+    return { step: "preview macro " + name,
+             text: M.previewText(result, macroLimits()),
+             via: "macro.preview", planLength: 1 };
+  }
+
+  function macroEditRun(stepsText, ctx) {
+    const M = macroModule();
+    const state = conversationState(ctx);
+    const doc = state.pending && state.pending.kind === "macro"
+      ? readMacro(ctx) : null;
+    if (!doc) {
+      return {
+        step: "edit the macro plan", via: "macro.edit", error: true,
+        planLength: 1,
+        text: "no macro plan is staged · preview a macro first · r.macro-pending\n"
+          + "nothing was changed · r.macro-none",
+      };
+    }
+    const steps = M.parseSteps(stepsText);
+    const result = M.check(doc.name, steps, macroLimits());
+    if (!result.ok) {
+      return { step: "edit the macro plan", via: "macro.edit", error: true,
+               planLength: 1, text: M.refusalText(result) };
+    }
+    const record = stageMacro(ctx, result, result.steps, true);
+    if (!record) {
+      return {
+        step: "edit the macro plan", via: "macro.edit", error: true,
+        planLength: 1,
+        text: "macro plan · " + doc.name + " · refused · r.macro-store\n"
+          + "the edited plan is larger than planVariantBytes ("
+          + LIMITS_RAW.planVariantBytes + " bytes); nothing was changed · r.macro-store",
+      };
+    }
+    stagePendingMacro(ctx, doc.name);
+    return { step: "edit the macro plan", via: "macro.edit",
+             text: M.editText(result, macroLimits()), planLength: 1 };
+  }
+
+  function macroListRun() {
+    const M = macroModule();
+    return { step: "show macros", via: "macro.list", planLength: 1,
+             text: M.listText(MACROS) };
+  }
+
+  function conversationNeed() {
+    return 'the full corrected request, for example "build a platformer" or "add 13 and 30".';
+  }
+
+  function revisionOf(text, last, ctx) {
+    const direct = match(text);
+    if (direct) return { text: text, skill: direct };
+    const steps = last && Array.isArray(last.steps) ? last.steps : [];
+    const prev = steps.length ? steps[steps.length - 1] : null;
+    const prevSkill = prev ? match(prev.text) : null;
+    if (!prevSkill) return null;
+    const tries = [];
+    if (prevSkill.op === "build") {
+      tries.push("build " + text);
+      tries.push(prev.text + " " + text);
+    } else if (prevSkill.op === "math.binary") {
+      const verb = String(prev.text || "").split(/\s+/)[0];
+      tries.push(verb + " " + text);
+      // A rewritten correction is stored as its own words ("13 plus 30"), so
+      // the first token is a number. Try the four math verbs as well.
+      ["add", "subtract", "multiply", "divide"].forEach(function (v) {
+        tries.push(v + " " + text);
+      });
+    } else if (prevSkill.op === "edit.apply") {
+      tries.push("make it " + text);
+      tries.push(prev.text + " " + text);
+    }
+    for (let i = 0; i < tries.length; i++) {
+      const hit = match(tries[i]);
+      if (hit) return { text: tries[i], skill: hit };
+    }
+    return null;
+  }
+
+  function conversationBefore(query, ctx) {
+    const hit = match(query);
+    if (!hit || String(hit.op).indexOf("conversation.") !== 0) return null;
+    const state = conversationState(ctx);
+
+    if (hit.op === "conversation.confirm") {
+      if (!state.pending) {
+        return { reply: {
+          text: "Nothing is pending, so I didn't run anything. Tell me the action you want to confirm.",
+          via: "conversation.confirm" } };
+      }
+      if (state.pending.kind === "clarify") {
+        return { reply: {
+          text: "Nothing has been applied yet. I still need " + state.pending.need,
+          via: "conversation.confirm" }, keepPending: true };
+      }
+      if (state.pending.kind === "repair") {
+        const doc = readRepair(ctx);
+        state.pending = null;
+        conversationSave(ctx, state);
+        if (!doc) {
+          return { reply: {
+            text: "The repair plan is no longer stored. Say \"repair this plan\" again and I will rebuild it.",
+            via: "conversation.confirm" } };
+        }
+        return { confirm: { kind: "repair", text: doc.name,
+                            steps: doc.steps.map(function (step) {
+                              return step.text;
+                            }), repair: doc } };
+      }
+      if (state.pending.kind === "variant") {
+        const variant = readVariant(ctx);
+        state.pending = null;
+        conversationSave(ctx, state);
+        clearVariant(ctx);
+        if (!variant) {
+          return { reply: {
+            text: "The compacted plan is no longer stored. Send the request again and I will rebuild the variant.",
+            via: "conversation.confirm" } };
+        }
+        return { confirm: { kind: "variant", text: variant.name,
+                            steps: variant.steps.map(function (step) {
+                              return step.text;
+                            }), variant: variant } };
+      }
+      if (state.pending.kind === "macro") {
+        const doc = readMacro(ctx);
+        state.pending = null;
+        conversationSave(ctx, state);
+        clearMacro(ctx);
+        if (!doc) {
+          return { reply: {
+            text: "The macro plan is no longer stored. Preview the macro again and I will rebuild it.",
+            via: "conversation.confirm" } };
+        }
+        return { confirm: { kind: "macro", text: doc.name,
+                            steps: doc.steps.map(function (step) {
+                              return String(step);
+                            }), macro: doc } };
+      }
+      if (state.pending.kind !== "action" || !state.pending.text) {
+        return { reply: {
+          text: "The pending action is not runnable. Tell me the action again.",
+          via: "conversation.confirm" } };
+      }
+      const pending = state.pending;
+      // Clear before running: one confirmation applies the action at most once,
+      // even if the action itself fails.
+      state.pending = null;
+      conversationSave(ctx, state);
+      return { confirm: pending };
+    }
+
+    if (hit.op === "conversation.reject") {
+      if (!state.pending) {
+        return { reply: { text: "Nothing to cancel — no action is pending.",
+                          via: "conversation.reject" } };
+      }
+      const pending = state.pending;
+      state.pending = null;
+      conversationSave(ctx, state);
+      clearVariant(ctx);
+      clearRepair(ctx);
+      clearMacro(ctx);
+      return { reply: {
+        text: 'Cancelled "' + (pending.text || "the pending action")
+          + '" — nothing was run.',
+        via: "conversation.reject" } };
+    }
+
+    if (hit.op === "conversation.repair") {
+      if (!state.last) {
+        return { reply: {
+          text: "There is no previous action to repair. Give me the command again.",
+          via: "conversation.repair" } };
+      }
+      return { reply: {
+        text: 'The last action was "' + state.last.text + '" (via '
+          + (state.last.via || "?") + '). Tell me what to change: "no, I meant …" '
+          + 'or "actually …". Nothing was re-run.',
+        via: "conversation.repair" }, keepPending: true };
+    }
+
+    if (hit.op === "conversation.correct") {
+      const candidate = String(hit.args.text || "").trim();
+      const revised = revisionOf(candidate, state.last, ctx);
+      if (!revised) {
+        const need = conversationNeed();
+        state.pending = { kind: "clarify", text: candidate, need: need,
+                          n: (state.turnsSeen || 0) + 1 };
+        conversationSave(ctx, state);
+        return { reply: {
+          text: 'I couldn\'t map "' + candidate + '" to a command. I need '
+            + need + ' Nothing was changed.',
+          via: "conversation.correct" }, keepPending: true };
+      }
+      if (revised.skill.op === "build") {
+        state.pending = { kind: "action", text: revised.text,
+                          op: revised.skill.op, steps: [revised.text],
+                          n: (state.turnsSeen || 0) + 1 };
+        conversationSave(ctx, state);
+        return { reply: {
+          text: 'I read that as "' + revised.text
+            + '". Say yes to build it once, or no to keep the current project.',
+          via: "conversation.correct" }, keepPending: true };
+      }
+      return { rewrite: revised.text, revisedFrom: String(query) };
+    }
+
+    if (hit.op === "conversation.show") {
+      return { reply: { text: conversationText(ctx), via: "conversation.show" },
+               keepPending: true };
+    }
+
+    if (hit.op === "conversation.clear") {
+      return { reply: { text: conversationClear(ctx), via: "conversation.clear" } };
+    }
+    return null;
+  }
+
+  /* The previous step feeds a page build. Keep the title and source from the
+   * step result when they exist, then fall back to the text itself. */
+  function prevWebInfo(ctx) {
+    const prev = String(ctx.prev || "").trim();
+    if (!prev) {
+      throw new Error("say what the page should be about — try: wikipedia ada lovelace then build a page about it");
+    }
+    const last = ctx.prevResult || {};
+    const lines = prev.split(/\n/).map(function (s) { return s.trim(); }).filter(Boolean);
+    let title = String(last.title || lines[0] || "Research note").replace(/^#+\s*/, "").slice(0, 90);
+    if (!title) title = "Research note";
+    return { title: title, text: prev, source: String(last.source || "") };
+  }
+
+  /* ------------------------------------------------------------ library -- */
+  const LIB_ALIAS = {
+    "c++": "cpp", "c plus plus": "cpp", "c#": "csharp", "c sharp": "csharp",
+    "dotnet": "csharp", ".net": "csharp", "js": "javascript", "ts": "typescript",
+    "gfx": "graphics", "gpu": "graphics", "shader": "shaders",
+    "pcg": "procedural-generation", "procgen": "procedural-generation",
+    "procedural": "procedural-generation", "2d": "2d-games", "3d": "graphics"
+  };
+
+  function libFold(s) {
+    return String(s || "").normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  }
+
+  function libTokens(q) {
+    const raw = libFold(q).match(/[a-z0-9+#.]+/g) || [];
+    const out = [];
+    raw.forEach(function (t) {
+      const a = LIB_ALIAS[t] || t;
+      if (a.length > 1 && out.indexOf(a) < 0) out.push(a);
+    });
+    return out;
+  }
+
+  const LIB_FIELDS = new WeakMap();
+  const LIB_WORDS = new WeakMap();
+
+  function libFields(rec) {
+    // Fold each field once per record. Search runs over thousands of records,
+    // so repeating normalize/split work per query token is the difference
+    // between a few milliseconds and half a second.
+    if (LIB_FIELDS.has(rec)) return LIB_FIELDS.get(rec);
+    const cls = rec.classification || {};
+    const search = rec.search || {};
+    const fields = [
+      { name: "title", w: 5, text: rec.title },
+      { name: "alias", w: 4, text: (search.aliases || []).join(" ") },
+      { name: "topic", w: 3, text: (cls.topics || []).join(" ") },
+      { name: "language", w: 3, text: (cls.programming_languages || []).join(" ") },
+      { name: "keyword", w: 2, text: (search.keywords || []).join(" ") },
+      { name: "id", w: 2, text: rec.id },
+      { name: "summary", w: 1, text: search.summary || "" }
+    ].map(function (f) {
+      return { name: f.name, w: f.w, text: libFold(f.text), words: null };
+    });
+    LIB_FIELDS.set(rec, fields);
+    return fields;
+  }
+
+  // One folded word map per record: word → {w, name}. Folded and split once;
+  // the inverted index below reuses it.
+  function libWordIndex(rec) {
+    if (LIB_WORDS.has(rec)) return LIB_WORDS.get(rec);
+    const fields = libFields(rec);
+    const map = new Map();
+    fields.forEach(function (f) {
+      f.text.split(/[^a-z0-9+#.]+/).forEach(function (w) {
+        if (!w) return;
+        const prev = map.get(w);
+        if (!prev || f.w > prev.w) map.set(w, { w: f.w, name: f.name });
+      });
+    });
+    LIB_WORDS.set(rec, map);
+    return map;
+  }
+
+  // Inverted index: word → [{i, w, name}]. Built lazily and rebuilt only when
+  // the record list changes, so a query touches matching postings instead of
+  // every record in the archive.
+  let LIB_INDEX = { recs: null, post: null, sorted: null };
+
+  function libIndex() {
+    const recs = (LIBRARY && LIBRARY.records) || [];
+    if (LIB_INDEX.recs === recs) return LIB_INDEX;
+    const post = new Map();
+    recs.forEach(function (rec, i) {
+      libWordIndex(rec).forEach(function (hit, word) {
+        let arr = post.get(word);
+        if (!arr) post.set(word, arr = []);
+        arr.push({ i: i, w: hit.w });
+      });
+    });
+    const sorted = Array.from(post.keys()).sort();
+    LIB_INDEX = { recs: recs, post: post, sorted: sorted };
+    return LIB_INDEX;
+  }
+
+  let LIB_SCORE = { len: 0, arr: null };
+
+  function libScoreBuffer(n) {
+    if (LIB_SCORE.len < n) LIB_SCORE = { len: n, arr: new Float64Array(n) };
+    return LIB_SCORE.arr;
+  }
+
+  function libTokenWords(index, token) {
+    const ext = [];
+    const pre = [];
+    let lo = 0, hi = index.sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (index.sorted[mid] < token) lo = mid + 1;
+      else hi = mid;
+    }
+    for (let k = lo; k < index.sorted.length; k++) {
+      const word = index.sorted[k];
+      if (word.indexOf(token) !== 0) break;
+      if (word !== token) ext.push(word);
+    }
+    if (token.length >= 4) {
+      const stop = Math.min(token.length, 48);
+      for (let n = 3; n < stop; n++) {
+        const word = token.slice(0, n);
+        if (index.post.has(word)) pre.push(word);
+      }
+    }
+    return { ext: ext, pre: pre };
+  }
+
+  // Reason label for one surviving result: the best-weighted field holding the
+  // token. Runs only for the handful of rows that reach the output.
+  function libReasonFor(rec, token) {
+    const map = libWordIndex(rec);
+    const exact = map.get(token);
+    if (exact) return exact;
+    if (token.length < 3) return null;
+    let best = null;
+    map.forEach(function (hit, word) {
+      if (word.length < 3) return;
+      if (!(word.indexOf(token) === 0 || token.indexOf(word) === 0)) return;
+      if (!best || hit.w > best.w) best = hit;
+    });
+    return best;
+  }
+
+  function libPushTop(top, item, limit) {
+    let at = top.length;
+    while (at > 0) {
+      const prev = top[at - 1];
+      const better = item.score > prev.score
+        || (item.score === prev.score && item.rec.title < prev.rec.title);
+      if (!better) break;
+      at--;
+    }
+    if (at >= limit) return;
+    top.splice(at, 0, item);
+    if (top.length > limit) top.length = limit;
+  }
+
+  function libTopQualifies(score, title, top, limit) {
+    if (top.length < limit) return true;
+    const last = top[top.length - 1];
+    return score > last.score || (score === last.score && title < last.rec.title);
+  }
+
+  function libLabel(rec) {
+    const cls = rec.classification || {};
+    const langs = (cls.programming_languages || []).join(", ") || "general";
+    return rec.title + " · " + (cls.level || "unrated") + " · " + langs
+      + " · id: " + rec.id;
+  }
+
+  function libResolve(term) {
+    if (!LIBRARY) return null;
+    const q = libFold(term);
+    if (!q) return null;
+    const recs = LIBRARY.records || [];
+    for (let i = 0; i < recs.length; i++) if (libFold(recs[i].id) === q) return recs[i];
+    for (let i = 0; i < recs.length; i++) {
+      if (libFold(recs[i].title) === q) return recs[i];
+    }
+    for (let i = 0; i < recs.length; i++) {
+      const r = recs[i];
+      if (libFold(r.id).indexOf(q) >= 0 || libFold(r.title).indexOf(q) >= 0) return r;
+      const aliases = (r.search && r.search.aliases) || [];
+      for (let j = 0; j < aliases.length; j++) {
+        if (libFold(aliases[j]).indexOf(q) >= 0) return r;
+      }
+    }
+    return null;
+  }
+
+  function libRank(query, limit, keep) {
+    const tokens = libTokens(query);
+    const top = [];
+    if (!tokens.length) return { tokens: tokens, top: top };
+    const max = limit || 5;
+    const index = libIndex();
+    const recs = LIBRARY.records || [];
+    const buf = libScoreBuffer(recs.length);
+    const touched = [];
+    for (let ti = 0; ti < tokens.length; ti++) {
+      const token = tokens[ti];
+      const parts = libTokenWords(index, token);
+      if (!parts.ext.length && !parts.pre.length) {
+        // Exact word only: the common case, and the cheapest.
+        const arr = index.post.get(token) || [];
+        for (let i = 0; i < arr.length; i++) {
+          const e = arr[i];
+          if (!buf[e.i]) touched.push(e.i);
+          buf[e.i] += e.w + 0.5;
+        }
+        continue;
+      }
+      const best = new Map();
+      function add(word, exact) {
+        const arr = index.post.get(word);
+        if (!arr) return;
+        for (let i = 0; i < arr.length; i++) {
+          const e = arr[i];
+          const packed = e.w * 2 + (exact ? 1 : 0);
+          const prev = best.get(e.i);
+          if (prev === undefined || packed > prev) best.set(e.i, packed);
+        }
+      }
+      add(token, true);
+      parts.ext.forEach(function (w) { add(w, false); });
+      parts.pre.forEach(function (w) { add(w, false); });
+      best.forEach(function (packed, ri) {
+        if (!buf[ri]) touched.push(ri);
+        const w = (packed - (packed & 1)) / 2;
+        buf[ri] += w + (packed & 1 ? 0.5 : 0);
+      });
+    }
+    for (let i = 0; i < touched.length; i++) {
+      const ri = touched[i];
+      const score = buf[ri];
+      buf[ri] = 0;
+      const rec = recs[ri];
+      if (keep && !keep(rec)) continue;
+      if (libTopQualifies(score, rec.title, top, max)) {
+        libPushTop(top, { rec: rec, score: score, reasons: null }, max);
+      }
+    }
+    top.forEach(function (item) {
+      item.reasons = [];
+      for (let ti = 0; ti < tokens.length; ti++) {
+        const hit = libReasonFor(item.rec, tokens[ti]);
+        if (hit) item.reasons.push(hit.name + ": " + tokens[ti]);
+      }
+    });
+    return { tokens: tokens, top: top };
+  }
+
+  function libSearch(query, limit) {
+    if (!LIBRARY) throw new Error("library catalog is not loaded");
+    const ranked = libRank(query, limit);
+    const tokens = ranked.tokens;
+    const top = ranked.top;
+    if (!tokens.length) return libStats();
+    if (!top.length) {
+      const topics = Object.keys((LIBRARY.stats && LIBRARY.stats.topics) || {}).slice(0, 10);
+      return "not in the archive for \"" + query + "\".\n\n"
+        + "No record mentions that. Topics I do have: " + topics.join(", ") + ".\n"
+        + "Try: find a book about cpp · what do i have on shaders · library stats";
+    }
+    return "archive matches for \"" + query + "\" (" + top.length + "):\n\n"
+      + top.map(function (h, i) {
+        return (i + 1) + ". " + libLabel(h.rec) + "\n   why: "
+          + h.reasons.slice(0, 4).join(", ");
+      }).join("\n");
+  }
+
+  /* Structured view for the dashboard Library panel. The panel does its own
+   * presentation and keeps local reading-status overrides; this only ranks and
+   * shapes records so search stays identical to the command path. */
+  function libRow(rec, reasons) {
+    const cls = rec.classification || {};
+    const reading = rec.reading || {};
+    return {
+      id: rec.id,
+      title: rec.title,
+      authors: rec.authors || [],
+      year: rec.year || null,
+      level: cls.level || "unrated",
+      topics: (cls.topics || []).slice(0, 6),
+      programming: (cls.programming_languages || []).slice(),
+      natural: (cls.natural_languages || []).slice(),
+      status: reading.status || "unread",
+      priority: reading.priority || 0,
+      next: (reading.next || []).slice(),
+      parts: (rec.parts || []).length,
+      summary: (rec.search && rec.search.summary) || "",
+      reason: (reasons || []).slice(0, 4)
+    };
+  }
+
+  function libPanel(query, opts) {
+    if (!LIBRARY) throw new Error("library catalog is not loaded");
+    opts = opts || {};
+    const limit = Math.max(1, Math.min(200, opts.limit || 60));
+    const keep = typeof opts.keep === "function" ? opts.keep : null;
+    const ranked = libRank(query, limit, keep);
+    if (!ranked.tokens.length) {
+      const recs = (LIBRARY.records || []).filter(function (rec) {
+        return !keep || keep(rec);
+      });
+      return {
+        query: String(query || ""),
+        total: recs.length,
+        rows: recs.slice(0, limit).map(function (rec) { return libRow(rec, []); })
+      };
+    }
+    return {
+      query: String(query || ""),
+      total: ranked.top.length,
+      rows: ranked.top.map(function (h) { return libRow(h.rec, h.reasons); })
+    };
+  }
+
+  function libStats() {
+    if (!LIBRARY) throw new Error("library catalog is not loaded");
+    const s = LIBRARY.stats || {};
+    const langs = Object.keys(s.programming || {}).map(function (k) {
+      return k + " " + s.programming[k];
+    }).join(", ") || "none";
+    const topics = Object.keys(s.topics || {}).slice(0, 10).join(", ");
+    return "library · " + (s.records || 0) + " records · " + (s.files || 0)
+      + " source files" + (s.parts ? " (" + s.parts + " parts)" : "") + "\n"
+      + "by language: " + langs + "\n"
+      + "topics: " + (topics || "none") + "\n"
+      + "ask: find a book about shaders · list books by language cpp · what should i read next";
+  }
+
+  function libByLevel(level) {
+    if (!LIBRARY) throw new Error("library catalog is not loaded");
+    const want = libFold(level);
+    const hits = (LIBRARY.records || []).filter(function (rec) {
+      return libFold((rec.classification || {}).level || "") === want;
+    });
+    if (!hits.length) {
+      return "no books tagged level \"" + level + "\" in the archive.\n\n"
+        + "Levels in the catalog: " + Object.keys((LIBRARY.stats || {}).levels || {})
+          .filter(function (k) { return LIBRARY.stats.levels[k]; }).join(", ");
+    }
+    return "books at " + want + " level (" + hits.length + "):\n\n"
+      + hits.map(function (rec, i) { return (i + 1) + ". " + libLabel(rec); }).join("\n");
+  }
+
+  function libByLanguage(lang) {
+    if (!LIBRARY) throw new Error("library catalog is not loaded");
+    const wanted = libTokens(lang);
+    const code = wanted[0] || libFold(lang);
+    const hits = (LIBRARY.records || []).filter(function (rec) {
+      const langs = (rec.classification || {}).programming_languages || [];
+      return langs.indexOf(code) >= 0;
+    });
+    if (!hits.length) {
+      return "no books tagged \"" + lang + "\" in the archive.\n\n"
+        + "Coverage right now is C++ and a little GLSL. Ask \"library stats\" for the full list.";
+    }
+    return "books tagged " + code + " (" + hits.length + "):\n\n"
+      + hits.map(function (rec, i) { return (i + 1) + ". " + libLabel(rec); }).join("\n");
+  }
+
+  function libGaps() {
+    if (!LIBRARY) throw new Error("library catalog is not loaded");
+    const recs = LIBRARY.records || [];
+    const stats = LIBRARY.stats || {};
+    const open = recs.filter(function (r) {
+      return !(((r.reading || {}).next) || []).length;
+    });
+    const thinLangs = Object.keys(stats.programming || {}).filter(function (k) {
+      return stats.programming[k] < 2;
+    });
+    const emptyLevels = Object.keys(stats.levels || {}).filter(function (k) {
+      return !stats.levels[k];
+    });
+    const missingMeta = recs.filter(function (r) {
+      return !(r.authors || []).length || !r.year
+        || !((r.source || {}).sha256);
+    }).length;
+    const lines = ["library gaps:"];
+    if (open.length) {
+      lines.push("· no recorded next book (" + open.length + "): "
+        + open.map(function (r) { return r.id; }).join(", "));
+    } else {
+      lines.push("· every record has a next-book link");
+    }
+    if (thinLangs.length) {
+      lines.push("· thin language coverage: " + thinLangs.map(function (k) {
+        return k + " (" + stats.programming[k] + ")";
+      }).join(", "));
+    }
+    if (emptyLevels.length) {
+      lines.push("· no records at level: " + emptyLevels.join(", "));
+    }
+    if (missingMeta) {
+      lines.push("· " + missingMeta + " record(s) still need authors, year, or a source hash");
+    }
+    lines.push("Add a free or purchased book, tag it, then link it with reading.next.");
+    return lines.join("\n");
+  }
+
+  function libNext(after) {
+    if (!LIBRARY) throw new Error("library catalog is not loaded");
+    const recs = LIBRARY.records || [];
+    if (after) {
+      const rec = libResolve(after);
+      if (!rec) {
+        return "no catalog record matched \"" + after + "\".\n\n"
+          + "Try a title or id, for example: what should i read after programming-2d-games";
+      }
+      const next = ((rec.reading || {}).next || []).map(function (id) {
+        return recs.filter(function (r) { return r.id === id; })[0];
+      }).filter(Boolean);
+      if (!next.length) {
+        return "after " + rec.title + ": no next book is recorded.\n\n"
+          + "That is a coverage gap — add a free or purchased follow-up, then link it with reading.next.";
+      }
+      return "after " + rec.title + ":\n\n"
+        + next.map(function (r, i) { return (i + 1) + ". " + libLabel(r); }).join("\n");
+    }
+    const unread = recs.filter(function (r) {
+      return ((r.reading || {}).status || "unread") !== "done";
+    }).sort(function (a, b) {
+      const pa = (a.reading || {}).priority || 9;
+      const pb = (b.reading || {}).priority || 9;
+      return pa - pb || (a.title < b.title ? -1 : 1);
+    });
+    if (!unread.length) return "everything in the archive is marked done.";
+    return "next up:\n\n"
+      + unread.slice(0, 3).map(function (r, i) { return (i + 1) + ". " + libLabel(r); }).join("\n");
+  }
+
+  /* ----------------------------------------------------------- language -- */
+  function langPct(r) {
+    return Math.round((r.confidence || 0) * 100) + "%";
+  }
+
+  function langReport(r, mode) {
+    const L = root.toolrxLang;
+    if (!r || (!r.lang && !(r.ambiguous && r.ambiguous.length))) {
+      return "unknown — no strong " + mode + "-language signals";
+    }
+    if (!r.lang && r.ambiguous) {
+      return "ambiguous — could be "
+        + r.ambiguous.map(function (x) { return L.nameOf(mode, x) + " (" + x + ")"; }).join(" or ")
+        + " · " + langPct(r) + " confidence";
+    }
+    let out = r.name + " (" + r.lang + ") · " + langPct(r) + " confidence";
+    if (r.signals && r.signals.length) out += "\n  signals: " + r.signals.join(", ");
+    if (r.alternatives && r.alternatives.length) {
+      out += "\n  also possible: " + r.alternatives.map(function (x) {
+        return L.nameOf(mode, x) + " (" + x + ")";
+      }).join(", ");
+    }
+    if (r.uncertain) out += "\n  not confident enough to act on without a clearer sample";
+    return out;
+  }
+
+  /* -------------------------------------------------------------- ops ---- */
+  const OPS = {
+    /* Step 60: the everyday file pack resolves to the same two ops the Python
+     * executor already ships. The tab has no real filesystem, so these read the
+     * virtual workspace through ctx.fs and refuse plainly when it is absent
+     * instead of claiming a file was opened. */
+    "fs.read_file": function (a, ctx) {
+      const p = String(a.path || "").trim();
+      if (!p) throw new Error("no file name given");
+      if (!ctx || !ctx.fs || typeof ctx.fs.read !== "function") {
+        throw new Error("file reads need the browser workspace");
+      }
+      if (typeof ctx.fs.exists === "function" && !ctx.fs.exists(p)) {
+        throw new Error("no such file: " + p);
+      }
+      return ctx.fs.read(p);
+    },
+    "fs.list_dir": function (a, ctx) {
+      if (!ctx || !ctx.fs || typeof ctx.fs.list !== "function") {
+        throw new Error("folder listings need the browser workspace");
+      }
+      return ctx.fs.list(a.path || "");
+    },
+    "library.stats": function () {
+      return libStats();
+    },
+    "library.find": function (a) {
+      return libSearch(a.topic || "", 5);
+    },
+    "library.language": function (a) {
+      return libByLanguage(a.lang || "");
+    },
+    "library.level": function (a) {
+      return libByLevel(a.level || "");
+    },
+    "library.next": function () {
+      return libNext("");
+    },
+    "library.after": function (a) {
+      return libNext(a.id || "");
+    },
+    "library.gaps": function () {
+      return libGaps();
+    },
+    "lang.detect": function (a, ctx) {
+      const L = root.toolrxLang;
+      if (!L || !L.ready || !L.ready()) {
+        throw new Error("language detection module is not loaded");
+      }
+      let text = String(a.text || "").trim();
+      if (!text || /^(?:this|that|it|the code|the text|this code|this text)$/i.test(text)) {
+        text = String((ctx && ctx.prev) || "").trim();
+      }
+      if (!text) {
+        throw new Error("no text to inspect — paste a snippet, or run a command first");
+      }
+      if (a.mode === "programming") return langReport(L.detectProgramming(text), "programming");
+      if (a.mode === "natural") return langReport(L.detectNatural(text), "natural");
+      const p = L.detectProgramming(text);
+      const n = L.detectNatural(text);
+      if (p.lang && p.confidence >= 0.75) return langReport(p, "programming");
+      if (n.lang && n.confidence >= 0.75) return langReport(n, "natural");
+      if (p.lang || n.lang
+          || (p.ambiguous && p.ambiguous.length)
+          || (n.ambiguous && n.ambiguous.length)) {
+        return "not confident enough to choose one language.\n\n"
+          + "programming: " + langReport(p, "programming") + "\n\n"
+          + "natural: " + langReport(n, "natural");
+      }
+      return "unknown — no strong programming or natural-language signals.\n\n"
+        + "Paste a code sample, or ask \"what programming language is …\" / "
+        + "\"what natural language is …\".";
+    },
+    "lang.reply": function (a) {
+      const L = root.toolrxLang;
+      if (!L || !L.ready || !L.ready()) {
+        throw new Error("language module is not loaded");
+      }
+      const raw = String((a && a.lang) || "").trim();
+      if (a && a.show) return fillLang(shellSay("reply_in"), replyLang());
+      if (!raw) return fillLang(shellSay("reply_in"), replyLang());
+      if (/^(?:off|stop|none|default|normal)$/i.test(raw)) {
+        setReplyLang("en");
+        return shellSay("reply_off", "en");
+      }
+      const code = L.replyLang(raw);
+      if (!code) throw new Error(shellSay("unknown_lang"));
+      setReplyLang(code);
+      return fillLang(L.say(code, "reply_in"), code);
+    },
+    "math.binary": function (a) {
+      const x = numOrThrow(a.a), y = numOrThrow(a.b);
+      switch (a.op) {
+        case "add": return fmt(x + y);
+        case "sub": return fmt(x - y);
+        case "mul": return fmt(x * y);
+        case "div": if (y === 0) throw new Error("division by zero"); return fmt(x / y);
+        case "mod": if (y === 0) throw new Error("division by zero"); return fmt(x % y);
+        case "pow": return fmt(Math.pow(x, y));
+        case "gcd": {
+          let p = Math.abs(int(x)), q = Math.abs(int(y));
+          while (q) { [p, q] = [q, p % q]; }
+          return fmt(p);
+        }
+        case "lcm": {
+          let p = Math.abs(int(x)), q = Math.abs(int(y)), g = p;
+          while (q) { [g, q] = [q, g % q]; }
+          return fmt(g ? p / g * Math.abs(int(y)) : 0);
+        }
+        case "min": return fmt(Math.min(x, y));
+        case "max": return fmt(Math.max(x, y));
+        case "pct_of": return fmt(x / 100 * y);
+        case "pct_change": return fmt((y - x) / Math.abs(x) * 100) + "%";
+        case "log": return fmt(Math.log(x) / Math.log(y));
+        case "divisible": return y === 0 ? "no (division by zero)" : (x % y === 0 ? "yes" : "no");
+        default: throw new Error("unknown binary op " + a.op);
+      }
+    },
+    "math.unary": function (a, ctx) {
+      const raw = a.a === undefined || a.a === null || a.a === "" || PRONOUN.test(String(a.a).trim())
+        ? prevNumber(ctx && ctx.prev) : a.a;
+      const x = numOrThrow(raw);
+      switch (a.op) {
+        case "square": return fmt(x * x);
+        case "cube": return fmt(x * x * x);
+        case "sqrt": if (x < 0) throw new Error("square root of a negative number"); return fmt(Math.sqrt(x));
+        case "cbrt": return fmt(Math.cbrt(x));
+        case "abs": return fmt(Math.abs(x));
+        case "neg": return fmt(-x);
+        case "round": return fmt(Math.round(x));
+        case "floor": return fmt(Math.floor(x));
+        case "ceil": return fmt(Math.ceil(x));
+        case "fact": {
+          const n = int(x);
+          if (n < 0 || n > 170) throw new Error("factorial needs 0..170");
+          let r = 1;
+          for (let i = 2; i <= n; i++) r *= i;
+          return fmt(r);
+        }
+        case "recip": if (x === 0) throw new Error("division by zero"); return fmt(1 / x);
+        case "isprime": {
+          const n = int(x);
+          if (n < 2) return "no";
+          for (let i = 2; i * i <= n; i++) if (n % i === 0) return "no";
+          return "yes";
+        }
+        case "iseven": return int(x) % 2 === 0 ? "yes" : "no";
+        case "isodd": return Math.abs(int(x) % 2) === 1 ? "yes" : "no";
+        case "sign": return String(Math.sign(x));
+        case "double": return fmt(x * 2);
+        case "half": return fmt(x / 2);
+        case "triple": return fmt(x * 3);
+        case "factors": {
+          const n = Math.abs(int(x));
+          if (!n) return "0";
+          const out = [];
+          for (let i = 1; i * i <= n; i++) {
+            if (n % i) continue;
+            out.push(i);
+            if (i !== n / i) out.push(n / i);
+          }
+          return out.sort((p, q) => p - q).join(", ");
+        }
+        case "primefactors": {
+          let n = Math.abs(int(x));
+          if (n < 2) return String(n);
+          const out = [];
+          for (let p = 2; p * p <= n; p++) {
+            while (n % p === 0) { out.push(p); n /= p; }
+          }
+          if (n > 1) out.push(n);
+          return out.join(" × ");
+        }
+        case "divcount": {
+          const n = Math.abs(int(x));
+          if (!n) return "0";
+          let count = 0;
+          for (let i = 1; i * i <= n; i++) {
+            if (n % i) continue;
+            count += i === n / i ? 1 : 2;
+          }
+          return fmt(count);
+        }
+        case "deg2rad": return fmt(x * Math.PI / 180);
+        case "rad2deg": return fmt(x * 180 / Math.PI);
+        default: throw new Error("unknown unary op " + a.op);
+      }
+    },
+    "math.list": function (a) {
+      const xs = String(a.list).split(/\s*(?:,|;|\band\b|\s)\s*/).map(num)
+        .filter(v => isFinite(v));
+      if (!xs.length) throw new Error("no numbers found");
+      const sorted = xs.slice().sort((p, q) => p - q);
+      const sum = xs.reduce((p, q) => p + q, 0);
+      switch (a.op) {
+        case "sum": return fmt(sum);
+        case "mean": return fmt(sum / xs.length);
+        case "median": {
+          const mid = Math.floor(sorted.length / 2);
+          return fmt(sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2);
+        }
+        case "mode": {
+          const counts = {};
+          xs.forEach(v => counts[v] = (counts[v] || 0) + 1);
+          const best = Math.max(...Object.values(counts));
+          return Object.keys(counts).filter(k => counts[k] === best).join(", ");
+        }
+        case "range": return fmt(sorted[sorted.length - 1] - sorted[0]);
+        case "stdev": {
+          const m = sum / xs.length;
+          return fmt(Math.sqrt(xs.reduce((p, q) => p + (q - m) * (q - m), 0) / xs.length));
+        }
+        case "minlist": return fmt(sorted[0]);
+        case "maxlist": return fmt(sorted[sorted.length - 1]);
+        case "product": return fmt(xs.reduce((p, q) => p * q, 1));
+        default: throw new Error("unknown list op " + a.op);
+      }
+    },
+    "math.expr": function (a) {
+      return fmt(evalExpr(a.expr));
+    },
+    "math.format": function (a) {
+      const x = numOrThrow(a.a);
+      switch (a.op) {
+        case "words": return numberToWords(x);
+        case "roman": return toRoman(x);
+        case "ordinal": return ordinal(x);
+        case "base2": return int(x).toString(2);
+        case "base8": return int(x).toString(8);
+        case "base16": return int(x).toString(16).toUpperCase();
+        case "sci": return x.toExponential();
+        default: throw new Error("unknown format " + a.op);
+      }
+    },
+    "unit.convert": function (a) {
+      const n = numOrThrow(a.n);
+      const v = convertUnit(n, a.from, a.to);
+      const label = u => UNIT_LABEL[u] || u;
+      return `${fmt(n)} ${label(a.from)} = ${fmt(v)} ${label(a.to)}`;
+    },
+    "text.transform": function (a, ctx) {
+      const t = resolveText(a.text, ctx);
+      const op = a.op;
+      switch (op) {
+        case "reverse": return Array.from(t).reverse().join("");
+        case "upper": return t.toUpperCase();
+        case "lower": return t.toLowerCase();
+        case "title": return t.replace(/\w\S*/g, w => w[0].toUpperCase() + w.slice(1).toLowerCase());
+        case "sentence": return t.toLowerCase().replace(/(^\s*\w|[.!?]\s+\w)/g, c => c.toUpperCase());
+        case "capitalize": return t.charAt(0).toUpperCase() + t.slice(1);
+        case "trim": return t.trim();
+        case "collapse": return t.replace(/\s+/g, " ").trim();
+        case "slug": return t.toLowerCase().trim().replace(/[^\w\s-]/g, "").replace(/[\s_]+/g, "-").replace(/-+/g, "-");
+        case "snake": return t.trim().replace(/[^\w\s-]/g, "").replace(/[\s-]+/g, "_").toLowerCase();
+        case "kebab": return t.trim().replace(/[^\w\s-]/g, "").replace(/[\s_]+/g, "-").toLowerCase();
+        case "camel": {
+          const p = t.trim().split(/[^\w]+/).filter(Boolean);
+          return p.map((w, i) => i ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w.toLowerCase()).join("");
+        }
+        case "pascal":
+          return t.trim().split(/[^\w]+/).filter(Boolean)
+            .map(w => w[0].toUpperCase() + w.slice(1).toLowerCase()).join("");
+        case "sortlines": return t.split("\n").sort().join("\n");
+        case "sortwords": return words(t).sort((x, y) => x.localeCompare(y)).join(" ");
+        case "uniqlines": return Array.from(new Set(t.split("\n"))).join("\n");
+        case "reverselines": return t.split("\n").reverse().join("\n");
+        case "reversewords": return words(t).reverse().join(" ");
+        case "striptags": return t.replace(/<[^>]*>/g, "");
+        case "leet": return t.replace(/[aeiost]/gi, c => ({ a: "4", e: "3", i: "1", o: "0", s: "5", t: "7" })[c.toLowerCase()] || c);
+        case "initials": return words(t).map(w => w[0].toUpperCase()).join("");
+        case "acronym": return words(t).filter(w => w.length > 2).map(w => w[0].toUpperCase()).join("");
+        case "longest": return words(t).reduce((b, w) => w.length > b.length ? w : b, "");
+        case "freq": {
+          const counts = {};
+          words(t.toLowerCase()).forEach(w => counts[w] = (counts[w] || 0) + 1);
+          return Object.entries(counts).sort((p, q) => q[1] - p[1]).slice(0, 20)
+            .map(([w, c]) => `${w}: ${c}`).join("\n");
+        }
+        case "charfreq": {
+          const counts = {};
+          for (const c of t.replace(/\s/g, "").toLowerCase()) counts[c] = (counts[c] || 0) + 1;
+          return Object.entries(counts).sort((p, q) => q[1] - p[1])
+            .map(([c, n]) => `${c}: ${n}`).join("\n");
+        }
+        case "indent": return t.split("\n").map(l => "  " + l).join("\n");
+        case "dedupe": {
+          const seen = new Set();
+          return words(t).filter(w => { const k = w.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; }).join(" ");
+        }
+        default: throw new Error("unknown text op " + op);
+      }
+    },
+    "text.count": function (a, ctx) {
+      const t = resolveText(a.text, ctx);
+      const what = a.what;
+      const counts = {
+        words: words(t).length,
+        chars: t.length,
+        lines: t ? t.split("\n").length : 0,
+        sentences: (t.match(/[^.!?]+[.!?]+/g) || []).length || (t.trim() ? 1 : 0),
+        vowels: (t.match(/[aeiou]/gi) || []).length,
+        consonants: (t.match(/[bcdfghjklmnpqrstvwxyz]/gi) || []).length,
+      };
+      return `${counts[what]} ${what}`;
+    },
+    "text.check": function (a, ctx) {
+      const t = resolveText(a.text, ctx);
+      const clean = s => words(String(s).toLowerCase()).join("");
+      if (a.op === "palindrome") {
+        const c = clean(t);
+        return c && c === Array.from(c).reverse().join("") ? "yes" : "no";
+      }
+      if (a.op === "anagram") {
+        const t2 = resolveText(a.text2, ctx);
+        const s1 = clean(t).split("").sort().join(""), s2 = clean(t2).split("").sort().join("");
+        return s1 && s1 === s2 ? "yes" : "no";
+      }
+      throw new Error("unknown check " + a.op);
+    },
+    "text.extract": function (a, ctx) {
+      const t = resolveText(a.text, ctx);
+      const patterns = {
+        emails: /[\w.+-]+@[\w-]+\.[\w.-]+/g,
+        urls: /https?:\/\/[^\s<>"')]+/g,
+        numbers: /-?\d[\d,]*(?:\.\d+)?/g,
+      };
+      const out = t.match(patterns[a.what]) || [];
+      return out.length ? Array.from(new Set(out)).join("\n") : "(none found)";
+    },
+    "text.replace": function (a, ctx) {
+      const t = resolveText(a.text, ctx);
+      return t.split(String(a.find)).join(String(a.repl));
+    },
+    "encode": function (a, ctx) {
+      const t = resolveText(a.text, ctx);
+      switch (a.op) {
+        case "b64e": return b64encode(t);
+        case "b64d": return b64decode(t);
+        case "urle": return encodeURIComponent(t);
+        case "urld": return decodeURIComponent(t);
+        case "hexe": return hexEncode(t);
+        case "hexd": return hexDecode(t);
+        case "bine": return Array.from(new TextEncoder().encode(t)).map(b => b.toString(2).padStart(8, "0")).join(" ");
+        case "bind": return new TextDecoder().decode(new Uint8Array(t.trim().split(/\s+/).map(b => parseInt(b, 2))));
+        case "rot13": return t.replace(/[a-z]/gi, c => {
+          const base = c <= "Z" ? 65 : 97;
+          return String.fromCharCode((c.charCodeAt(0) - base + 13) % 26 + base);
+        });
+        case "morse": return words(t.toLowerCase()).map(w => w.split("").map(c => MORSE[c] || "?").join(" ")).join(" / ");
+        case "unmorse": return t.trim().split(/\s*\/\s*/).map(w => w.split(/\s+/).map(c => UNMORSE[c] || "?").join("")).join(" ");
+        default: throw new Error("unknown encoding " + a.op);
+      }
+    },
+    "hash": function (a, ctx) {
+      return hashText(a.algo, resolveText(a.text, ctx));
+    },
+    "json.op": function (a, ctx) {
+      const t = resolveText(a.text, ctx);
+      let obj;
+      if (a.op === "validate") {
+        try { JSON.parse(t); return "valid JSON"; }
+        catch (e) { return "invalid JSON: " + e.message; }
+      }
+      try { obj = JSON.parse(t); }
+      catch (e) { throw new Error("invalid JSON: " + e.message); }
+      switch (a.op) {
+        case "pretty": return JSON.stringify(obj, null, 2);
+        case "minify": return JSON.stringify(obj);
+        case "keys": return Array.isArray(obj) ? obj.map((_, i) => i).join("\n") : Object.keys(obj).join("\n");
+        case "values": return (Array.isArray(obj) ? obj : Object.values(obj)).map(v => typeof v === "object" ? JSON.stringify(v) : String(v)).join("\n");
+        case "tocsv": return jsonToCsv(obj);
+        default: throw new Error("unknown json op " + a.op);
+      }
+    },
+    "csv.op": function (a, ctx) {
+      return csvToJson(resolveText(a.text, ctx));
+    },
+    "date.op": function (a, ctx) {
+      const now = new Date();
+      const dateOf = v => {
+        if (v === undefined || v === null || v === "") return now;
+        const n = num(v);
+        if (isFinite(n) && String(v).trim().match(/^\d+$/)) return new Date(n > 1e11 ? n : n * 1000);
+        const d = new Date(v);
+        if (isNaN(d)) throw new Error("not a date: " + v);
+        return d;
+      };
+      const iso = d => d.toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+      switch (a.op) {
+        case "time": return iso(now);
+        case "now": return iso(now);
+        case "today": return now.toISOString().slice(0, 10);
+        case "unix": return String(Math.floor(now.getTime() / 1000));
+        case "add": return iso(new Date(now.getTime() + numOrThrow(a.n) * 86400000));
+        case "sub": return iso(new Date(now.getTime() - numOrThrow(a.n) * 86400000));
+        case "diff": {
+          const d1 = dateOf(a.a), d2 = dateOf(a.b);
+          return fmt(Math.round((d2 - d1) / 86400000)) + " days";
+        }
+        case "weekday": return dateOf(a.text).toLocaleDateString(undefined, { weekday: "long" });
+        case "leap": {
+          const y = int(numOrThrow(a.n));
+          return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0 ? "yes" : "no";
+        }
+        case "parse": {
+          const d = dateOf(a.text);
+          return `${iso(d)}\nunix: ${Math.floor(d.getTime() / 1000)}\nweekday: ${d.toLocaleDateString(undefined, { weekday: "long" })}`;
+        }
+        case "dayname": return now.toLocaleDateString(undefined, { weekday: "long" });
+        case "year": return String(now.getFullYear());
+        case "daysin": {
+          const t = String(a.text).toLowerCase().replace(/[?.!]/g, "").trim();
+          const leap = n => (n % 4 === 0 && n % 100 !== 0) || n % 400 === 0;
+          const months = {
+            january: 31, february: leap(now.getFullYear()) ? 29 : 28, march: 31,
+            april: 30, may: 31, june: 30, july: 31, august: 31, september: 30,
+            october: 31, november: 30, december: 31,
+          };
+          const names = Object.keys(months).filter(m => m.startsWith(t) || t.startsWith(m));
+          if (names.length) return String(months[names[0]]);
+          if (t === "this month" || t === "the month") {
+            return String(new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate());
+          }
+          throw new Error("unknown month: " + a.text);
+        }
+        default: throw new Error("unknown date op " + a.op);
+      }
+    },
+    "color.op": function (a) {
+      switch (a.op) {
+        case "toRgb": {
+          const [r, g, b] = parseColor(a.text);
+          return `rgb(${r}, ${g}, ${b})`;
+        }
+        case "toHex": return toHex([numOrThrow(a.a), numOrThrow(a.b), numOrThrow(a.c)]);
+        case "lighten":
+        case "darken": {
+          const rgb = parseColor(a.text);
+          const p = numOrThrow(a.n) / 100 * (a.op === "lighten" ? 1 : -1);
+          return toHex(rgb.map(v => v + (p > 0 ? (255 - v) * p : v * p)));
+        }
+        case "mix": {
+          const x = parseColor(a.a), y = parseColor(a.b);
+          return toHex(x.map((v, i) => (v + y[i]) / 2));
+        }
+        case "contrast": return fmt(contrast(a.a, a.b)) + ":1";
+        case "luminance": return fmt(luminance(parseColor(a.text)));
+        default: throw new Error("unknown color op " + a.op);
+      }
+    },
+    "gen.op": function (a, ctx) {
+      const rnd = crypto.getRandomValues(new Uint32Array(1))[0] / 4294967296;
+      const rint = (lo, hi) => lo + Math.floor(rnd * (hi - lo + 1));
+      switch (a.op) {
+        case "coin": return rnd < 0.5 ? "heads" : "tails";
+        case "die": return String(rint(1, 6));
+        case "dice": {
+          const count = Math.min(100, int(numOrThrow(a.a)));
+          return Array.from({ length: count }, () => rint(1, 6)).join(" ");
+        }
+        case "dice2": return Array.from({ length: Math.min(100, int(numOrThrow(a.a))) }, () => rint(1, int(numOrThrow(a.b)))).join(" ");
+        case "rand": {
+          const lo = Math.min(numOrThrow(a.a), numOrThrow(a.b));
+          const hi = Math.max(numOrThrow(a.a), numOrThrow(a.b));
+          return fmt(rint(Math.ceil(lo), Math.floor(hi)));
+        }
+        case "pick": {
+          const opts = String(a.text).split(/\s*(?:,|\bor\b|\|)\s*/).filter(Boolean);
+          if (!opts.length) throw new Error("nothing to pick from");
+          return opts[rint(0, opts.length - 1)];
+        }
+        case "shuffle": {
+          const opts = String(a.text).split(/\s*(?:,|\band\b)\s*/).filter(Boolean);
+          for (let i = opts.length - 1; i > 0; i--) {
+            const j = rint(0, i);
+            [opts[i], opts[j]] = [opts[j], opts[i]];
+          }
+          return opts.join(", ");
+        }
+        case "lorem": {
+          const pool = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud exercitation ullamco laboris nisi aliquip ex ea commodo consequat".split(" ");
+          const n = Math.min(500, int(numOrThrow(a.a)));
+          return Array.from({ length: n }, () => pool[rint(0, pool.length - 1)]).join(" ");
+        }
+        case "uuid":
+          return (root.crypto && crypto.randomUUID) ? crypto.randomUUID() :
+            "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+              const r = rint(0, 15), v = c === "x" ? r : (r & 3 | 8);
+              return v.toString(16);
+            });
+        case "pw":
+        case "pwlen": {
+          const len = a.op === "pwlen" ? Math.min(128, int(numOrThrow(a.a))) : 20;
+          const chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*-_=+";
+          const bytes = crypto.getRandomValues(new Uint32Array(len));
+          return Array.from(bytes, b => chars[b % chars.length]).join("");
+        }
+        default: throw new Error("unknown generator " + a.op);
+      }
+    },
+    "regex.op": function (a, ctx) {
+      const t = resolveText(a.text, ctx);
+      if (a.op === "test") {
+        const r = parseFlags(a.pat);
+        return r.re.test(t) ? "match" : "no match";
+      }
+      if (a.op === "match") {
+        const r = parseFlags(a.pat);
+        const flags = r.re.flags.includes("g") ? r.re.flags : r.re.flags + "g";
+        const re = new RegExp(r.re.source, flags);
+        const found = Array.from(t.matchAll(re));
+        return found.length ? found.map(m => m[0]).join("\n") : "(no matches)";
+      }
+      if (a.op === "replace") {
+        const r = parseFlags(a.pat);
+        const flags = r.re.flags.includes("g") ? r.re.flags : r.re.flags + "g";
+        return t.replace(new RegExp(r.re.source, flags), String(a.repl));
+      }
+      throw new Error("unknown regex op " + a.op);
+    },
+    "echo": function (a, ctx) { return resolveText(a.text, ctx); },
+    "fact.capital": function (a) {
+      const key = factKey(a.subject);
+      if (!key) return "name a country — e.g. \"capital of france\"";
+      const hit = CAPITALS[key];
+      return hit || `I don't have "${key}" in the local capitals table (it is a small, fixed list).`;
+    },
+    "fact.symbol": function (a) {
+      const key = factKey(a.subject);
+      const hit = SYMBOLS[key];
+      return hit ? hit : `I don't have "${key}" in the local element table.`;
+    },
+    "preview": function (a, ctx) {
+      const html = ctx.preview();
+      return html ? "preview updated" : "nothing to preview yet — try: build a calculator app";
+    },
+    "preview.theme": function (a, ctx) {
+      const ok = ctx.theme(a.theme);
+      return ok ? `preview switched to ${a.theme}` : "no preview yet — build something first";
+    },
+    "system": function (a, ctx) {
+      if (a.op === "who") {
+        const st = root.toolrxLlm && root.toolrxLlm.status ? root.toolrxLlm.status() : null;
+        return "toolrx — a deterministic micro tool router. In this tab it runs a hashed n-gram model plus a "
+          + meta.count + "-command pattern library. No LLM by default, no API key, no signal leaving the page"
+          + (st && st.enabled
+            ? " — the optional LLM adapter is enabled in this browser and only runs on llm plan / llm patch."
+            : " unless you explicitly enable the optional LLM adapter in Command Center.");
+      }
+      if (a.op === "limits") return limitsText();
+      const topic = (a.topic || "").toLowerCase();
+      if (a.op === "help" || a.op === "help") {
+        return helpText(topic, ctx);
+      }
+      return helpText(topic, ctx);
+    },
+    "build": function (a, ctx) {
+      return ctx.build(a.kind, a.desc);
+    },
+    "build.web": async function (a, ctx) {
+      if (!ctx.webPage) throw new Error("web pages need the browser workspace");
+      const topic = String(a.topic || "").trim();
+      if (topic) {
+        if (!ctx.web || typeof ctx.web.search !== "function") throw new Error("web search is not available here");
+        const r = await ctx.web.search(topic);
+        return ctx.webPage({ title: r.title || topic, text: r.text || "", source: r.source || "" });
+      }
+      return ctx.webPage(prevWebInfo(ctx));
+    },
+    "edit.apply": function (a, ctx) {
+      if (!ctx.edit) throw new Error("composable edits need the browser workspace");
+      return ctx.edit(a.patch, a.arg || a.size);
+    },
+    "edit.apply.many": function (a, ctx) {
+      if (!ctx.editMany) throw new Error("composable edits need the browser workspace");
+      return ctx.editMany(a.list);
+    },
+    "project.grow": function (a, ctx) {
+      if (!ctx.grow) throw new Error("project growth needs the browser workspace");
+      return ctx.grow("project", "");
+    },
+    "module.expand": function (a, ctx) {
+      if (!ctx.grow) throw new Error("project growth needs the browser workspace");
+      return ctx.grow("module", a.module);
+    },
+    "system.add": function (a, ctx) {
+      if (!ctx.grow) throw new Error("project growth needs the browser workspace");
+      return ctx.grow("system", a.system);
+    },
+    "system.add.many": function (a, ctx) {
+      if (!ctx.growSystems) throw new Error("project growth needs the browser workspace");
+      const names = String(a.list || "").toLowerCase().split(/\s+and\s+/)
+        .map(function (s) { return s.trim(); }).filter(Boolean);
+      return ctx.growSystems(names);
+    },
+    "context.show": function (a, ctx) {
+      if (!ctx.contextShow) throw new Error("context needs the browser workspace");
+      return ctx.contextShow();
+    },
+    "think.decompose": function (a, ctx) { return thinkRun("decompose", a, ctx); },
+    "think.reason": function (a, ctx) { return thinkRun("reason", a, ctx); },
+    "think.tradeoff": function (a, ctx) { return thinkRun("tradeoff", a, ctx); },
+    "think.critique": function (a, ctx) { return thinkRun("critique", a, ctx); },
+    "explain.project": function (a, ctx) { return explainRun("project", "", ctx); },
+    "explain.plan": function (a, ctx) { return explainRun("plan", "", ctx); },
+    "explain.theme": function (a, ctx) { return explainRun("theme", "", ctx); },
+    "explain.project.context": function (a, ctx) {
+      return explainRun("project", "context", ctx);
+    },
+    "explain.project.journal": function (a, ctx) {
+      return explainRun("project", "journal", ctx);
+    },
+    "verify.files": function (a, ctx) { return verifyRun("files", "", ctx); },
+    "verify.smoke": function (a, ctx) { return verifyRun("smoke", "", ctx); },
+    "verify.report": function (a, ctx) { return verifyRun("report", "", ctx); },
+    "verify.report.context": function (a, ctx) {
+      return verifyRun("report", "context", ctx);
+    },
+    "verify.report.journal": function (a, ctx) {
+      return verifyRun("report", "journal", ctx);
+    },
+    "repair.plan": function (a, ctx) { return repairPlan(a, ctx); },
+    "repair.resume": function () {
+      return "resume · only works as its own turn\n"
+        + "the failed step and pending suffix come from the last run; "
+        + "say resume on its own";
+    },
+    "context.snapshot": function (a, ctx) {
+      if (!ctx.contextSnapshot) throw new Error("context needs the browser workspace");
+      return ctx.contextSnapshot();
+    },
+    "context.diff": function (a, ctx) {
+      if (!ctx.contextDiff) throw new Error("context needs the browser workspace");
+      return ctx.contextDiff();
+    },
+    "context.compact": function (a, ctx) {
+      if (!ctx.contextCompact) throw new Error("context needs the browser workspace");
+      return ctx.contextCompact();
+    },
+    "context.clear": function (a, ctx) {
+      if (!ctx.contextClear) throw new Error("context needs the browser workspace");
+      return ctx.contextClear(false);
+    },
+    "context.clear.all": function (a, ctx) {
+      if (!ctx.contextClear) throw new Error("context needs the browser workspace");
+      return ctx.contextClear(true);
+    },
+    "context.continue": function (a, ctx) {
+      if (!ctx.contextContinue) throw new Error("context needs the browser workspace");
+      return ctx.contextContinue();
+    },
+    "context.expand": function (a, ctx) {
+      if (!ctx.contextExpand) throw new Error("context needs the browser workspace");
+      return ctx.contextExpand(a.more);
+    },
+    "context.apply_others": function (a, ctx) {
+      if (!ctx.contextApplyOthers) throw new Error("context needs the browser workspace");
+      return ctx.contextApplyOthers();
+    },
+    "edit.undo": function (a, ctx) {
+      if (!ctx.undo) throw new Error("undo needs the browser workspace");
+      return ctx.undo();
+    },
+    "llm.status": function (a, ctx) {
+      if (!ctx.llmStatus) throw new Error("the optional LLM adapter is not loaded");
+      return ctx.llmStatus();
+    },
+    "llm.on": function (a, ctx) {
+      if (!ctx.llmEnable) throw new Error("the optional LLM adapter is not loaded");
+      return ctx.llmEnable(true);
+    },
+    "llm.off": function (a, ctx) {
+      if (!ctx.llmEnable) throw new Error("the optional LLM adapter is not loaded");
+      return ctx.llmEnable(false);
+    },
+    "llm.cache": function (a, ctx) {
+      if (!ctx.llmCacheClear) throw new Error("the optional LLM adapter is not loaded");
+      return ctx.llmCacheClear();
+    },
+    "llm.plan": function (a, ctx) {
+      if (!ctx.llmPlan) throw new Error("LLM plans need the browser workspace");
+      const prompt = String(a.prompt || "").trim();
+      if (!prompt) throw new Error("say what to plan, e.g. llm plan a cozy mail route");
+      return ctx.llmPlan(prompt);
+    },
+    "llm.patch": function (a, ctx) {
+      if (!ctx.llmPatch) throw new Error("LLM patches need the browser workspace");
+      return ctx.llmPatch(a.file, a.instruction);
+    },
+    "llm.apply": function (a, ctx) {
+      if (!ctx.llmApply) throw new Error("applying an LLM patch needs the browser workspace");
+      return ctx.llmApply();
+    },
+    "llm.discard": function (a, ctx) {
+      if (!ctx.llmDiscard) throw new Error("discarding an LLM patch needs the browser workspace");
+      return ctx.llmDiscard();
+    },
+    "plan": function (a, ctx) {
+      if (!ctx.architecture) throw new Error("architecture briefs need the browser workspace");
+      return ctx.architecture(a.kind || a.desc || "app", a.desc || a.kind || "");
+    },
+    "blueprint": function (a, ctx) {
+      if (!ctx.blueprint) throw new Error("blueprints need the browser workspace");
+      return ctx.blueprint(a.kind || a.desc || "app", a.desc || a.kind || "");
+    },
+    "project.new": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.new(a.name);
+    },
+    "project.list": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.list();
+    },
+    "project.open": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.open(a.slug);
+    },
+    "project.delete": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.remove(a.slug);
+    },
+    "project.rename": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.rename(a.slug, a.name);
+    },
+    "project.files": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.files(a.slug);
+    },
+    "project.title": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.title(a.slug, a.name);
+    },
+    "project.theme": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.theme(a.slug, a.theme);
+    },
+    "project.themeToggle": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.themeToggle(a.slug);
+    },
+    "project.note": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.note(a.slug, a.text);
+    },
+    "project.export": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.exportBundle(a.slug);
+    },
+    "project.import": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.importBundle(a.bundle);
+    },
+    "workspace.export": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.exportWorkspace();
+    },
+    "workspace.import": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.importWorkspace(a.bundle);
+    },
+    "workspace.bundles": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.bundles();
+    },
+    "memory.remember": function (a, ctx) { return memoryRemember(a, ctx); },
+    "memory.note": function (a, ctx) { return memoryNote(a, ctx); },
+    "memory.recall": function (a, ctx) { return memoryRecall(a, ctx); },
+    "memory.list": function (a, ctx) { return memoryList(a, ctx); },
+    "memory.forget": function (a, ctx) { return memoryForget(a, ctx); },
+    "memory.context": function (a, ctx) { return memoryContext(a, ctx); },
+    "journal.show": function (a, ctx) { return journalShow(ctx); },
+    "journal.query": function (a, ctx) { return journalQuery(a, ctx); },
+    "journal.clear": function (a, ctx) { return journalClear(ctx); },
+    "workspace.index": function (a, ctx) { return workspaceRender("index", {}, ctx); },
+    "workspace.themes": function (a, ctx) { return workspaceRender("themes", {}, ctx); },
+    "workspace.decisions": function (a, ctx) { return workspaceRender("decisions", a, ctx); },
+    "workspace.export.index": function (a, ctx) {
+      if (!ctx.project) throw new Error("projects need the browser workspace");
+      return ctx.project.exportWorkspaceIndex();
+    },
+    "events.show": function (a, ctx) {
+      if (!ctx.eventsShow) throw new Error("the event log needs the browser workspace");
+      return ctx.eventsShow();
+    },
+    "events.replay": async function (a, ctx) {
+      if (!ctx.eventsReplay) throw new Error("replay needs the browser workspace");
+      const out = await ctx.eventsReplay();
+      return {
+        text: out && out.text ? out.text : "replay · nothing ran",
+        replay: out ? { ok: !!out.ok, steps: out.steps || 0,
+                        failed: out.failed || 0, at: out.at || 0 } : null,
+      };
+    },
+    "events.export": function (a, ctx) {
+      if (!ctx.eventsExport) throw new Error("the event log needs the browser workspace");
+      return ctx.eventsExport();
+    },
+    "events.import": function (a, ctx) {
+      if (!ctx.eventsImport) throw new Error("the event log needs the browser workspace");
+      return ctx.eventsImport(a.bundle);
+    },
+    "style.show": function (a, ctx) {
+      const S = root.toolrxStyle;
+      const name = ctx && typeof ctx.style === "function" ? ctx.style() : "concise";
+      if (!S) return "style · " + name + "\nthe style module is not loaded";
+      return S.showText(name, { maxChars: LIMITS_RAW.styleChars });
+    },
+    "style.set": function (a, ctx) {
+      const S = root.toolrxStyle;
+      if (!S) throw new Error("the style module is not loaded");
+      const name = S.normalize(a && a.style);
+      if (!name) {
+        throw new Error("unknown style: " + String(a && a.style || "")
+          + " — use concise, explanatory, or tutorial");
+      }
+      const applied = ctx && typeof ctx.setStyle === "function"
+        ? ctx.setStyle(name) : name;
+      return S.setText(applied, { maxChars: LIMITS_RAW.styleChars });
+    },
+    // runPrompt intercepts these before dispatch so a confirmation can run the
+    // staged action. Direct exec keeps the same honest answers.
+    "conversation.show": function (a, ctx) { return conversationText(ctx); },
+    "conversation.clear": function (a, ctx) { return conversationClear(ctx); },
+    "conversation.confirm": function () {
+      return "Nothing is pending, so I didn't run anything. Tell me the action you want to confirm.";
+    },
+    "conversation.reject": function () {
+      return "Nothing to cancel — no action is pending.";
+    },
+    "conversation.repair": function (a, ctx) {
+      const state = conversationState(ctx);
+      return state.last
+        ? 'The last action was "' + state.last.text + '". Tell me what to change.'
+        : "There is no previous action to repair. Give me the command again.";
+    },
+    "conversation.correct": function () {
+      return "Tell me the full corrected request, for example \"build a platformer\" or \"add 13 and 30\".";
+    },
+    "chat": function (a, ctx) {
+      const text = chatReply((a && a.text) || (ctx && ctx.step) || "", ctx);
+      return { text: text || "I'm here. Say a little more.", chat: true };
+    },
+    "web.search": async function (a, ctx) {
+      if (!ctx.web) throw new Error("web access needs the browser workspace");
+      return ctx.web.search(a.q);
+    },
+    "web.answer": async function (a, ctx) {
+      if (!ctx.web) throw new Error("web access needs the browser workspace");
+      return ctx.web.answer(a.q);
+    },
+    "web.define": async function (a, ctx) {
+      if (!ctx.web) throw new Error("web access needs the browser workspace");
+      return ctx.web.define(a.word);
+    },
+    "web.weather": async function (a, ctx) {
+      if (!ctx.web) throw new Error("web access needs the browser workspace");
+      return ctx.web.weather(a.place);
+    },
+    "text.summarize": function (a, ctx) {
+      const text = resolveText(a.text, ctx);
+      const out = summarizeText(text, a.n ? Number(a.n) : 3);
+      const last = ctx.prevResult;
+      if (last && last.source) {
+        return { text: out, source: last.source, title: last.title || "" };
+      }
+      return out;
+    },
+    "text.headings": function (a, ctx) {
+      const text = resolveText(a.text, ctx);
+      const headings = headingsOf(text);
+      return headings.length
+        ? headings.map(function (h) { return h.text; }).join("\n")
+        : "(no headings found)";
+    },
+    "text.outline": function (a, ctx) {
+      return outlineOf(resolveText(a.text, ctx));
+    },
+    "text.firstlines": function (a, ctx) {
+      return firstLines(resolveText(a.text, ctx), a.n);
+    },
+    "text.table": function (a, ctx) {
+      return tableOf(resolveText(a.text, ctx));
+    },
+    "text.list": function (a, ctx) {
+      const got = extractorInput(a.text, ctx);
+      return extractorResult(got, listItemsOf(got.text), "list items",
+        "(no list items found)");
+    },
+    "text.facts": function (a, ctx) {
+      const got = extractorInput(a.text, ctx);
+      return extractorResult(got, keyFactsOf(got.text), "key facts",
+        "(no key facts found)");
+    },
+    "text.code": function (a, ctx) {
+      const got = extractorInput(a.text, ctx);
+      return extractorResult(got, codeOutlineOf(got.text), "functions or classes",
+        "(no functions or classes found)");
+    },
+    "text.diff": function (a, ctx) {
+      const left = extractorInput(a.a, ctx), right = extractorInput(a.b, ctx);
+      const out = diffSummaryOf(left.text, right.text);
+      if (!left.cut && !right.cut) return out;
+      const parts = [];
+      if (left.cut) parts.push("left " + left.total);
+      if (right.cut) parts.push("right " + right.total);
+      return out + "\n(input truncated at " + LIMITS_RAW.extractChars
+        + " chars: " + parts.join(", ") + ")";
+    },
+  };
+
+  function limitsText() {
+    const L = LIMITS_RAW;
+    const order = [
+      ["singleChars", "one routed request"],
+      ["planChars", "one plan"],
+      ["planSteps", "steps per plan"],
+      ["planBuildBytes", "estimated build output"],
+      ["planEditBytes", "estimated edit output"],
+      ["planVariantBytes", "stored compacted plan"],
+      ["thinkChars", "thinking input"],
+      ["thinkGoals", "goals listed per thinking run"],
+      ["thinkRules", "rules evaluated per critique"],
+      ["explainChars", "one project or plan explanation"],
+      ["explainFiles", "files listed per explanation"],
+      ["explainEdits", "recent edits listed per explanation"],
+      ["computeChars", "one pure-compute script"],
+      ["computeStatements", "statements in one script"],
+      ["computeOps", "evaluated nodes in one script"],
+      ["computeVars", "local variables in one script"],
+      ["computeMs", "wall budget for one script"],
+      ["computeResultChars", "rendered result of one script"],
+      ["repairPasses", "repair passes per failed plan"],
+      ["traceBytes", "stored reasoning trace"],
+      ["blockBytes", "verbatim block"],
+      ["stepMs", "per-step wall clock"],
+      ["planMs", "whole-plan wall clock"],
+      ["projectFileBytes", "one project file"],
+      ["projectBytes", "one project"],
+      ["projectFiles", "files per project"],
+      ["buildMs", "one build"],
+      ["readFileBytes", "one file read"],
+      ["readTotalBytes", "all reads combined"],
+      ["contextBytes", "context store"],
+      ["contextKeep", "session rows kept raw"],
+      ["contextAutoAt", "auto-compaction trigger percent"],
+      ["contextSummary", "summary lines per entry"],
+      ["undoDepth", "undo history"],
+      ["outputChars", "one chat reply"],
+      ["bundleBytes", "one export bundle"],
+      ["extractChars", "extractor input"],
+      ["extractItems", "extractor output lines"],
+      ["diffLines", "diff lines per side"],
+      ["conversationTurns", "stored conversation turns"],
+      ["conversationBytes", "conversation state"],
+      ["journalEntries", "decisions kept per project"],
+      ["journalBytes", "serialized project journal"],
+      ["journalText", "one journal entry"],
+      ["workspaceProjects", "projects in one workspace index"],
+      ["workspaceTopics", "topics per indexed project"],
+      ["workspaceRows", "rows in one cross-project answer"],
+      ["workspaceIndexBytes", "serialized workspace index"],
+      ["workspaceChars", "one cross-project answer"],
+      ["eventEntries", "operator events kept per project"],
+      ["eventBytes", "serialized operator event log"],
+      ["eventText", "one operator event line"],
+      ["verifyFiles", "expected and actual files listed per verification"],
+      ["verifyChecks", "smoke checks run per verification"],
+      ["verifyReportChars", "one verification report"],
+      ["styleChars", "response wrapper per result"],
+    ];
+    const rows = ["limits · source toolrx/limits.json → web/limits.js (version "
+      + L.version + ")"];
+    for (const [key, label] of order) {
+      rows.push("  " + key.padEnd(16) + String(L[key]).padStart(9) + "  " + label);
+    }
+    return rows.join("\n");
+  }
+
+  function helpText(topic, ctx) {
+    const cats = meta.categories || {};
+    if (topic) {
+      const hits = search(topic, 40);
+      if (hits.length) {
+        return `commands matching "${topic}" (${hits.length} shown):\n\n` +
+          hits.map(c => "  " + c.d).join("\n");
+      }
+      return `no commands matched "${topic}". Categories: ` + Object.keys(cats).join(", ");
+    }
+    const lines = ["deterministic command library: " + meta.count + " commands"];
+    for (const [k, v] of Object.entries(cats)) lines.push(`  ${k.padEnd(10)} ${v}`);
+    lines.push("");
+    lines.push("examples:");
+    lines.push("  multiply 67 and 420");
+    lines.push("  square 67");
+    lines.push("  convert 5 km to miles");
+    lines.push("  count the words in notes.txt");
+    lines.push("  build a calculator app");
+    lines.push("  build an rpg");
+    lines.push("  plan a todo app");
+    lines.push("  new project notes / list projects / show project files");
+    lines.push("  change the page title to … / add a theme toggle / make this project light");
+    lines.push("  add a footer note saying …");
+    lines.push("  wikipedia ursula k le guin / define serendipity / weather in reykjavik");
+    lines.push("  wikipedia ada lovelace then build a page about it");
+    lines.push("  build a page about grace hopper · make a website about it");
+    lines.push("  find a book about shaders · list books by language cpp");
+    lines.push("  what should i read next · library stats · library gaps");
+    lines.push("  what language is this: #include <iostream>");
+    lines.push("  what natural language is this: ¿qué hora es?");
+    lines.push("  i feel overwhelmed · tell me a joke · remember my name is ada");
+    lines.push("  remember my favorite color is teal · what do you remember · forget my favorite color");
+    lines.push("  what was i working on · what did i build last");
+    lines.push("  think about build a platformer · reason step by step · critique this plan");
+    lines.push("  repair this plan after a failed step · what went wrong");
+    lines.push("  read notes.txt then count the words");
+    lines.push("");
+    lines.push('say "help math" or "help text" for a category');
+    return lines.join("\n");
+  }
+
+  /* ------------------------------------------------------------ matching -- */
+  function compile(data) {
+    meta = { count: data.count || data.commands.length, categories: data.categories || {} };
+    LIBRARY = data.library || null;
+    MACROS = data.macros || null;
+    COMMANDS = data.commands.map(c => Object.assign({}, c, { rx: new RegExp(c.re, "i") }));
+    BY_OP = Object.create(null);
+    for (const c of COMMANDS) (BY_OP[c.op] = BY_OP[c.op] || []).push(c);
+  }
+
+  function applyArgs(spec, m) {
+    const out = {};
+    for (const k in spec) {
+      const v = spec[k];
+      if (typeof v === "string" && /^\$\d+$/.test(v)) {
+        out[k] = m[Number(v.slice(1))];
+      } else if (typeof v === "string" && /\$\d+/.test(v)) {
+        out[k] = v.replace(/\$(\d+)/g, function (_, n) {
+          return m[Number(n)] == null ? "" : m[Number(n)];
+        });
+      } else out[k] = v;
+    }
+    return out;
+  }
+
+  function match(q) {
+    const query = String(q).replace(/\s+/g, " ").trim()
+      .replace(/[?!]+$/, "").replace(/\.$/, "");
+    if (!query) return null;
+    for (const c of COMMANDS) {
+      const m = c.rx.exec(query);
+      if (m) return { id: c.id, op: c.op, args: applyArgs(c.args, m), desc: c.d, cat: c.c };
+    }
+    return null;
+  }
+
+  function search(term, limit) {
+    const t = String(term).toLowerCase();
+    const out = [];
+    for (const c of COMMANDS) {
+      if (c.d && c.d.toLowerCase().includes(t)) out.push(c);
+      if (out.length >= (limit || 50)) break;
+    }
+    return out;
+  }
+
+  /* The generator stores one display pattern per shape (for example
+   * "build a {k} app") with the literal values in args. A few display
+   * placeholders are shorthand for a longer arg name; map those, fill only
+   * literal values, and leave capture placeholders ($1) for the composer. */
+  const FILL_ALIAS = { k: "kind", d: "desc", t: "theme" };
+  function fillDisplay(cmd) {
+    const d = String(cmd.d || "");
+    if (d.indexOf("{") < 0) return d;
+    const args = cmd.args || {};
+    return d.replace(/\{(\w+)\}/g, function (m, k) {
+      const key = Object.prototype.hasOwnProperty.call(args, k) ? k : FILL_ALIAS[k];
+      const v = key ? args[key] : undefined;
+      if (typeof v === "string" && v && v[0] !== "$") return v;
+      return m;
+    });
+  }
+
+  /* Browsable catalog for the UI: filter by display text, op, and/or category,
+   * without compiling or executing anything. Rows are deduped on the visible
+   * text so one shape does not flood the list with identical lines. */
+  function catalog(term, cat, limit) {
+    const t = String(term || "").toLowerCase();
+    const c = String(cat || "").toLowerCase();
+    const out = [];
+    const seen = Object.create(null);
+    for (const cmd of COMMANDS) {
+      if (c && cmd.c !== c) continue;
+      const d = fillDisplay(cmd);
+      if (t && (d + " " + (cmd.op || "")).toLowerCase().indexOf(t) < 0) continue;
+      if (seen[d]) continue;
+      seen[d] = 1;
+      out.push({ id: cmd.id, op: cmd.op, d: d, c: cmd.c });
+      if (out.length >= (limit || 100)) break;
+    }
+    return out;
+  }
+
+  /* ------------------------------------------------------------- planner -- */
+  /* Values come from toolrx/limits.json via web/limits.js. */
+  const LIMITS = Object.freeze({
+    single: LIMITS_RAW.singleChars, plan: LIMITS_RAW.planChars,
+    steps: LIMITS_RAW.planSteps, block: LIMITS_RAW.blockBytes,
+    stepMs: LIMITS_RAW.stepMs, planMs: LIMITS_RAW.planMs,
+  });
+  const CONNECTOR_RE = /\s*(?:;|->|→|\bthen\b|\bafter that\b|\band then\b|\bfollowed by\b)\s*/i;
+  const SENTENCE_RE = /(?<=[.!?])\s+(?=[a-z0-9"'(\[])/i;
+
+  /* Verbatim "write the following into <file>:" capture. The block bypasses
+   * plan splitting and the command matcher, but the target path still has to
+   * be relative and traversal-free, and the body is checked for injection. */
+  const BLOCK_HEADER = /^[ \t]*(?:write|save|put|create|append)[ \t]+(?:the[ \t]+)?(?:following|below|block|text)[ \t]+(?:into|to|in|as)[ \t]+([A-Za-z0-9._/\-]+)[ \t]*:[ \t]*(?:\r?\n)?/i;
+  const BLOCK_END = /^[ \t]*(?:end|eof|end[ \t]+of[ \t]+block|end[ \t]+block|\.)[ \t]*$/im;
+  const BLOCK_INJECTION = [
+    /ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions/i,
+    /disregard\s+(?:all\s+)?(?:previous|prior|above)\s+instructions/i,
+    /reveal\s+(?:the\s+)?(?:system\s+)?prompt/i,
+    /developer\s+mode/i,
+    /jailbreak/i,
+    /you\s+are\s+now\s+(?:dan|unrestricted|root)/i,
+  ];
+
+  function byteLength(text) {
+    if (root.toolrxContext && root.toolrxContext.byteLength) {
+      return root.toolrxContext.byteLength(text);
+    }
+    return new TextEncoder().encode(String(text == null ? "" : text)).length;
+  }
+
+  function blockCapture(text) {
+    const raw = String(text == null ? "" : text);
+    const m = BLOCK_HEADER.exec(raw);
+    if (!m) return null;
+    const header = raw.slice(0, m.index + m[0].length).trim().split(/\n/)[0];
+    const path = m[1];
+    if (raw.indexOf("\x00") !== -1) {
+      return { ok: false, header: header, path: path, reason: "null byte rejected" };
+    }
+    if (path.charAt(0) === "/" || path.indexOf("\\") !== -1
+        || path.split("/").indexOf("..") !== -1) {
+      return { ok: false, header: header, path: path,
+               reason: "path traversal (..) rejected" };
+    }
+    let rest = raw.slice(m.index + m[0].length);
+    const end = BLOCK_END.exec(rest);
+    const terminated = !!end;
+    if (end) rest = rest.slice(0, end.index);
+    if (rest.endsWith("\r\n")) rest = rest.slice(0, -2);
+    else if (rest.endsWith("\n")) rest = rest.slice(0, -1);
+    if (!rest.trim()) {
+      return { ok: false, header: header, path: path,
+               reason: "empty block — nothing to write" };
+    }
+    const bytes = byteLength(rest);
+    if (bytes > LIMITS.block) {
+      return { ok: false, header: header, path: path,
+               reason: "block too large (" + bytes + " > " + LIMITS.block
+                 + " bytes); split it into smaller writes" };
+    }
+    for (const re of BLOCK_INJECTION) {
+      const hit = re.exec(rest);
+      if (hit) {
+        return { ok: false, header: header, path: path,
+                 reason: "injection pattern: " + JSON.stringify(hit[0]) };
+      }
+    }
+    return { ok: true, header: header, path: path, content: rest,
+             bytes: bytes, terminated: terminated };
+  }
+
+  function runBlockWrite(block, ctx) {
+    if (!block.ok) {
+      return { step: block.header, text: block.reason, error: true,
+               via: "block.write" };
+    }
+    if (!ctx || !ctx.fs || typeof ctx.fs.write !== "function") {
+      return { step: block.header, error: true, via: "block.write",
+               text: "file writes need the browser workspace" };
+    }
+    try {
+      const wrote = ctx.fs.write(block.path, block.content);
+      return {
+        step: block.header, via: "block.write",
+        text: "wrote " + block.path + " · " + block.bytes + " bytes byte-exact"
+          + (block.terminated ? " (terminated by an end marker)" : "") + "\n"
+          + String(wrote == null ? "" : wrote),
+      };
+    } catch (e) {
+      return { step: block.header, text: String(e && e.message || e),
+               error: true, via: "block.write" };
+    }
+  }
+
+  function chunkStep(text, limit) {
+    let rest = String(text || "").trim();
+    if (!rest) return [];
+    if (rest.length <= limit) return [rest];
+    const out = [];
+    while (rest.length > limit) {
+      let cut = rest.lastIndexOf(" ", limit);
+      if (cut < limit / 2) cut = limit;
+      const piece = rest.slice(0, cut).trim();
+      if (piece) out.push(piece);
+      rest = rest.slice(cut).trim();
+    }
+    if (rest) out.push(rest);
+    return out;
+  }
+
+  function sentenceCount(text) {
+    return String(text || "").split(SENTENCE_RE).filter(function (s) { return s.trim(); }).length;
+  }
+
+  function hasNumberedLines(text) {
+    return String(text || "").split(/\n+/).filter(function (line) {
+      return /^\s*(?:\d+[.)]|[-*•])\s*/.test(line);
+    }).length >= 2;
+  }
+
+  function isPlan(text) {
+    const raw = String(text == null ? "" : text).trim();
+    if (!raw) return false;
+    return raw.length > LIMITS.single
+      || CONNECTOR_RE.test(raw)
+      || hasNumberedLines(raw)
+      || raw.split(/\n+/).filter(Boolean).length > 1
+      || (sentenceCount(raw) >= 3 && raw.length >= 240);
+  }
+
+  function splitPromptInfo(q) {
+    const raw = String(q == null ? "" : q).replace(/\r/g, "").trim();
+    if (!raw) return { steps: [], total: 0, truncated: false, overLimit: false, plan: false };
+    const lines = raw.split(/\n+/).map(function (line) {
+      return line.replace(/^\s*(?:\d+[.)]|[-*•])\s*/, "").trim();
+    }).filter(Boolean);
+    const source = lines.length > 1 ? lines : [raw];
+    const plan = isPlan(raw);
+    const parts = [];
+    for (const piece of source) {
+      const sentences = plan ? piece.split(SENTENCE_RE) : [piece];
+      for (const sentence of sentences) {
+        for (const step of sentence.split(CONNECTOR_RE)) {
+          const clean = step.trim();
+          if (clean) parts.push(clean);
+        }
+      }
+    }
+    const steps = [];
+    for (const part of parts) {
+      for (const chunk of chunkStep(part, LIMITS.single)) steps.push(chunk);
+    }
+    const total = steps.length;
+    return {
+      steps: steps.slice(0, LIMITS.steps),
+      all: steps,
+      total: total,
+      truncated: total > LIMITS.steps,
+      overLimit: total > LIMITS.steps,
+      plan: plan,
+    };
+  }
+
+  function splitPrompt(q) {
+    return splitPromptInfo(q).steps;
+  }
+
+  function numberLimit(value, fallback) {
+    const n = Number(value);
+    return (isFinite(n) && n > 0) ? Math.round(n) : fallback;
+  }
+
+  /* The budget is reported even when a request is refused, so the caller can
+   * name the cap that stopped it. Time is a worst-case bound: every step gets
+   * `stepMs`, so a plan can only fit when steps × stepMs <= planMs. The five
+   * `bars` are the same descriptors the dashboard renders; they use the same
+   * caps and never recompute a number. */
+  function previewBudget(chars, steps, opts) {
+    const o = opts || {};
+    const stepMs = numberLimit(o.stepMs, LIMITS.stepMs);
+    const planMs = numberLimit(o.planMs, LIMITS.planMs);
+    const worstCaseMs = steps * stepMs;
+    const contextUsed = numberLimit(o.contextBytes, 0);
+    const contextMax = numberLimit(o.contextMax, LIMITS.contextBytes);
+    const projectUsed = numberLimit(o.projectBytes, 0);
+    const projectMax = numberLimit(o.projectMax, LIMITS.projectBytes);
+    const B = root.toolrxBudget;
+    const bars = B ? B.bars({
+      chars: { used: chars, max: LIMITS.plan },
+      steps: { used: steps, max: LIMITS.steps },
+      context: { used: contextUsed, max: contextMax },
+      project: { used: projectUsed, max: projectMax },
+      time: { used: worstCaseMs, max: planMs },
+    }) : [];
+    return {
+      chars: chars, maxChars: LIMITS.plan,
+      steps: steps, maxSteps: LIMITS.steps,
+      stepMs: stepMs, planMs: planMs, worstCaseMs: worstCaseMs,
+      timeFits: worstCaseMs <= planMs,
+      fits: chars <= LIMITS.plan && steps <= LIMITS.steps
+        && worstCaseMs <= planMs,
+      bars: bars,
+    };
+  }
+
+  /* Step 52: turn an over-budget plan into one named compacted variant. The
+   * rewrite module owns the selection; this function only supplies the five
+   * maxima and the two explicit project estimates from limits.json. */
+  function rewritePlan(text, info, budget, opts) {
+    const R = root.toolrxPlanRewrite;
+    if (!R) return null;
+    const o = opts || {};
+    return R.rewrite({
+      text: text,
+      steps: (info.all || info.steps || []).map(function (step) {
+        const hit = match(step);
+        return { text: step, via: hit ? hit.op : "router", exact: !!hit };
+      }),
+      stepMs: budget.stepMs,
+      planMs: budget.planMs,
+      maxChars: LIMITS.plan,
+      maxSteps: LIMITS.steps,
+      contextBytes: numberLimit(o.contextBytes, 0),
+      contextMax: numberLimit(o.contextMax, LIMITS.contextBytes),
+      projectBytes: numberLimit(o.projectBytes, 0),
+      projectMax: numberLimit(o.projectMax, LIMITS.projectBytes),
+      buildBytes: LIMITS_RAW.planBuildBytes,
+      editBytes: LIMITS_RAW.planEditBytes,
+    });
+  }
+
+  function barLine(bars) {
+    const B = root.toolrxBudget;
+    return bars.map(function (bar) {
+      const mark = bar.estimated ? "est. " : "";
+      const text = B ? B.format(bar.used, bar.unit) + " / "
+        + B.format(bar.max, bar.unit) : bar.used + " / " + bar.max;
+      return bar.label + " " + mark + text;
+    }).join(" · ");
+  }
+
+  function variantText(v) {
+    const lines = [
+      "plan variant · " + v.name + " (" + v.over.join(" + ") + " over budget)",
+      "before: " + barLine(v.beforeBars),
+      "after:  " + barLine(v.afterBars),
+      "kept " + v.steps.length + " of " + (v.steps.length + v.dropped.length)
+        + " steps in their original order"
+    ];
+    if (v.dropped.length) {
+      lines.push("dropped (lower value under the named budget):");
+      v.dropped.slice(0, 8).forEach(function (drop) {
+        lines.push("  · " + String(drop.text).slice(0, 120) + " · " + drop.why);
+      });
+      if (v.dropped.length > 8) {
+        lines.push("  · … " + (v.dropped.length - 8) + " more");
+      }
+    }
+    lines.push('say yes to run exactly these steps, no to keep the project '
+      + 'untouched, or send an edited request');
+    return lines.join("\n");
+  }
+
+  /* The variant lives beside conversation memory, not inside it: a full plan
+   * can be larger than the short-turn cap. `planVariantBytes` bounds it. */
+  const VARIANT_KEY = "planVariant";
+  const VARIANT_VERSION = 1;
+
+  function readVariant(ctx) {
+    const mem = memoryStore(ctx);
+    const raw = mem ? mem.get(VARIANT_KEY) : null;
+    if (!raw || typeof raw !== "object" || raw.version !== VARIANT_VERSION
+        || !Array.isArray(raw.steps)) return null;
+    return raw;
+  }
+
+  function stageVariant(ctx, variant, original) {
+    const mem = memoryStore(ctx);
+    if (!mem) return null;
+    const R = root.toolrxPlanRewrite;
+    const record = R ? R.variantRecord(variant, original, {
+      maxText: LIMITS.single,
+      maxBytes: LIMITS_RAW.planVariantBytes,
+    }) : null;
+    if (!record) return null;
+    mem.set(VARIANT_KEY, record);
+    return record;
+  }
+
+  function clearVariant(ctx) {
+    const mem = memoryStore(ctx);
+    if (mem) mem.set(VARIANT_KEY, null);
+  }
+
+  function stagePendingVariant(ctx, variant, original) {
+    const state = conversationState(ctx);
+    state.pending = {
+      kind: "variant",
+      text: String(variant.name || "compact"),
+      over: variant.over.slice(),
+      n: (state.turnsSeen || 0) + 1,
+    };
+    conversationSave(ctx, state);
+  }
+
+  /* ------------------------------------------------------------ thinking ---- */
+  /* Step 53: four deterministic programs. The handler resolves the topic (a
+   * file, the previous result, the active plan, the context, or a literal),
+   * splits it with the real planner, and hands everything to the pure module.
+   * Nothing here invents a claim: the module's rule ids carry the reasoning. */
+  const PLAN_REF = /^(?:the\s+|this\s+|my\s+|the\s+active\s+)?plan$/i;
+  const PREV_REF = /^(?:the\s+)?(?:previous|last|that)(?:\s+(?:step|result|answer|output))?$/i;
+  const CONTEXT_REF = /^(?:the\s+)?(?:context|active\s+context|what\s+is\s+in\s+context)$/i;
+
+  function planStepList(state) {
+    const steps = state && state.plan && Array.isArray(state.plan.steps)
+      ? state.plan.steps : [];
+    return steps.map(function (text, i) {
+      const hit = match(text);
+      return {
+        text: String(text),
+        status: (state.plan.status && state.plan.status[i]) || "pending",
+        op: hit ? hit.op : "router",
+        exact: !!hit,
+      };
+    });
+  }
+
+  function thinkResolve(args, ctx, mode) {
+    const raw = String((args && args.topic) || "").replace(/\s+/g, " ").trim();
+    const state = typeof ctx.think === "function" ? ctx.think() : null;
+    const planText = state && state.plan ? state.plan.steps.join("\n") : "";
+    if (!raw) {
+      if (mode === "critique") {
+        return { text: planText, source: planText
+                   ? (state.plan.from || "active plan") : "none",
+                 planRef: !!planText };
+      }
+      return { text: "", source: "none", planRef: false };
+    }
+    if (PLAN_REF.test(raw)) {
+      return { text: planText, source: planText
+                 ? (state.plan.from || "active plan") : "none",
+               planRef: !!planText };
+    }
+    if (PREV_REF.test(raw)) {
+      // Inside a plan, prev is the step that just ran. Outside one, the last
+      // recorded turn is the previous result.
+      const conv = conversationState(ctx);
+      const last = conv.last && conv.last.result ? conv.last.result : "";
+      return { text: String(ctx.prev || last || ""), source: "previous result",
+               planRef: false };
+    }
+    if (CONTEXT_REF.test(raw)) {
+      return { text: state ? String(state.context || "") : "",
+               source: "context", planRef: false };
+    }
+    if (ctx.fs && /^[\w./-]+$/.test(raw) && ctx.fs.exists(raw)) {
+      return { text: ctx.fs.read(raw), source: "file " + raw, planRef: false };
+    }
+    return { text: raw, source: "literal", planRef: false };
+  }
+
+  function thinkRun(mode, args, ctx) {
+    const T = root.toolrxThinking;
+    if (!T) throw new Error("thinking module is not loaded");
+    const state = typeof ctx.think === "function" ? ctx.think() : null;
+    const resolved = thinkResolve(args, ctx, mode);
+    const input = {
+      text: resolved.text,
+      source: resolved.source,
+      literal: resolved.source === "literal",
+      contextBytes: state ? state.contextBytes : 0,
+      project: state ? state.project : null,
+      limits: state ? state.limits : {},
+    };
+    if (mode === "decompose" || mode === "reason") {
+      if (resolved.text) {
+        const info = splitPromptInfo(resolved.text);
+        input.goals = (info.all || info.steps).map(function (text) {
+          const hit = match(text);
+          return { text: text, op: hit ? hit.op : "router", exact: !!hit };
+        });
+        input.sequenced = /\b(?:then|after|once|finally|next)\b/i.test(resolved.text);
+      }
+    } else if (mode === "tradeoff") {
+      const options = T.splitOptions(resolved.text);
+      const routes = options.slice(0, 2).map(function (option) {
+        return !!match(option);
+      });
+      if (routes.some(Boolean)) input.optionRoutes = routes;
+    } else if (mode === "critique") {
+      if (resolved.planRef && state && state.plan) {
+        input.plan = { steps: planStepList(state) };
+        input.text = state.plan.steps.join("\n");
+      } else if (resolved.text) {
+        const info = splitPromptInfo(resolved.text);
+        input.plan = {
+          dry: true,
+          steps: (info.all || info.steps).map(function (text) {
+            const hit = match(text);
+            return { text: text, status: "pending",
+                     op: hit ? hit.op : "router", exact: !!hit };
+          }),
+        };
+        input.text = resolved.text;
+      } else {
+        input.plan = { steps: [] };
+      }
+    }
+    const text = T.run(mode, input);
+    /* A route with nothing to work on is not a run worth remembering: it must
+     * not become the "last run" that the next critique inspects. */
+    const empty = mode === "critique"
+      ? !input.plan || !input.plan.steps.length
+      : !String(resolved.text || "").trim();
+    if (empty) return { text: text, empty: true };
+    const TR = root.toolrxTrace;
+    const via = "think." + mode;
+    const planSteps = input.plan && Array.isArray(input.plan.steps)
+      ? input.plan.steps.map(function (step) {
+        return String(step && step.text != null ? step.text : step);
+      })
+      : (input.goals || []).map(function (goal) { return String(goal.text); });
+    const trace = TR ? TR.record({
+      via: via,
+      text: text,
+      rule: TR.decisionRuleOf(via, text),
+      decision: TR.decisionOf(via, text),
+      source: resolved.source || "",
+      planSteps: planSteps,
+    }, { maxText: LIMITS.single, maxBytes: LIMITS_RAW.traceBytes }) : null;
+    return { text: text, trace: trace };
+  }
+
+  /* Step 61: one pure explanation over stored state. The handler never writes
+   * a project file; only the two explicit store routes touch context or the
+   * bounded journal. */
+  function explainRun(target, store, ctx) {
+    const T = root.toolrxExplain;
+    if (!T) throw new Error("explain module is not loaded");
+    const state = typeof ctx.explain === "function" ? ctx.explain() : null;
+    if (!state) throw new Error("explain needs the browser workspace");
+    const text = T.run(target, state);
+    if (!store) return { text: text };
+    if (typeof ctx.explainStore !== "function") {
+      return { text: text + "\nstoring needs the browser workspace" };
+    }
+    return { text: ctx.explainStore(store, target, text) };
+  }
+
+  /* Step 66: one pure verification over stored state. Expected files come from
+   * the stored build spec, actual files from the project, and every smoke
+   * check reads project text only. Only the two explicit store routes touch
+   * context or the bounded journal. */
+  function verifyRun(target, store, ctx) {
+    const V = root.toolrxVerify;
+    if (!V) throw new Error("verify module is not loaded");
+    const state = typeof ctx.verify === "function" ? ctx.verify() : null;
+    if (!state) throw new Error("verify needs the browser workspace");
+    const text = V.run(target, state);
+    if (!store) return { text: text };
+    if (typeof ctx.verifyStore !== "function") {
+      return { text: text + "\nstoring needs the browser workspace" };
+    }
+    return { text: ctx.verifyStore(store, target, text) };
+  }
+
+  /* -------------------------------------------------------------- repair ---- */
+  /* Step 54: one bounded critique pass over the last failed plan. The pure
+   * module picks retry/revise/refuse; this handler stages the revised suffix
+   * beside conversation memory and reuses the yes/no confirmation path. */
+  const REPAIR_KEY = "planRepair";
+  const REPAIR_VERSION = 1;
+
+  function readRepair(ctx) {
+    const mem = memoryStore(ctx);
+    const raw = mem ? mem.get(REPAIR_KEY) : null;
+    if (!raw || typeof raw !== "object" || raw.version !== REPAIR_VERSION
+        || !Array.isArray(raw.steps)) return null;
+    return raw;
+  }
+
+  function stageRepair(ctx, doc) {
+    const mem = memoryStore(ctx);
+    if (!mem) return null;
+    mem.set(REPAIR_KEY, doc);
+    return doc;
+  }
+
+  function clearRepair(ctx) {
+    const mem = memoryStore(ctx);
+    if (mem) mem.set(REPAIR_KEY, null);
+  }
+
+  function repairPlan(args, ctx) {
+    const R = root.toolrxRepair;
+    if (!R) throw new Error("repair module is not loaded");
+    const state = typeof ctx.repair === "function" ? ctx.repair()
+      : typeof ctx.think === "function" ? ctx.think() : null;
+    const plan = state && state.plan;
+    if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) {
+      return "repair · nothing to repair\nthe last run has no plan; run a plan first";
+    }
+    const failedAt = Number.isInteger(plan.failedAt) ? plan.failedAt : -1;
+    if (failedAt < 0) {
+      return 'repair · nothing to repair\nthe last run has no failed step · '
+        + 'say "critique this plan" to inspect it';
+    }
+    const previous = readRepair(ctx);
+    const stepInfo = plan.steps.map(function (text) {
+      const hit = match(text);
+      return { text: text, op: hit ? hit.op : "router", exact: !!hit };
+    });
+    const errorText = String(plan.errorText || "");
+    const out = R.plan({
+      steps: stepInfo,
+      failedAt: failedAt,
+      errorText: errorText,
+      passes: previous ? Number(previous.passes) || 0 : 0,
+      maxPasses: LIMITS_RAW.repairPasses,
+      limits: {
+        planSteps: LIMITS_RAW.planSteps,
+        planChars: LIMITS_RAW.planChars,
+        planVariantBytes: LIMITS_RAW.planVariantBytes,
+      },
+      originalSteps: previous && Array.isArray(previous.original)
+        && previous.original.length ? previous.original.length : plan.steps.length,
+    });
+    const body = R.text(out);
+    const TR = root.toolrxTrace;
+    const traceFor = function (kind, rule, text) {
+      return TR ? TR.record({
+        via: "repair.plan", text: text, rule: rule, decision: kind,
+        source: "last run", planSteps: plan.steps,
+      }, { maxText: LIMITS.single, maxBytes: LIMITS_RAW.traceBytes }) : null;
+    };
+    if (out.kind === "none" || out.kind === "refuse") {
+      return { text: body, trace: traceFor(out.kind, out.rule, body) };
+    }
+    const original = previous && Array.isArray(previous.original)
+      && previous.original.length ? previous.original : stepInfo;
+    const doc = R.record(out, {
+      steps: stepInfo,
+      originalSteps: original,
+      errorText: errorText,
+    }, { maxText: LIMITS.single, maxBytes: LIMITS_RAW.planVariantBytes });
+    if (!doc) {
+      const refused = body + "\nrepair: none · the record is larger than "
+        + "planVariantBytes (" + LIMITS_RAW.planVariantBytes
+        + " bytes); nothing was staged · r.repair-record";
+      return { text: refused, trace: traceFor("refuse", "r.repair-record",
+                                             refused) };
+    }
+    stageRepair(ctx, doc);
+    const conv = conversationState(ctx);
+    conv.pending = {
+      kind: "repair",
+      text: doc.name,
+      steps: doc.steps.map(function (step) { return step.text; }),
+      passes: doc.passes,
+      n: (conv.turnsSeen || 0) + 1,
+    };
+    conversationSave(ctx, conv);
+    return { text: body, keepPending: true,
+             trace: traceFor(out.kind, out.rule, body) };
+  }
+
+  /* Preview a plan without executing anything. Exact command matches are
+   * labelled with their operation; the rest will use the hashed router. When a
+   * budget would be exceeded, the preview carries one deterministic compacted
+   * variant instead of only a refusal (step 52). */
+  function planPreview(q, opts) {
+    const text = String(q == null ? "" : q);
+    const macroHit = match(text);
+    if (macroHit && (macroHit.op === "macro.run"
+                     || macroHit.op === "macro.preview")) {
+      const expanded = macroExpand(macroHit.args.name);
+      const budget = previewBudget(text.length, expanded.total, opts);
+      if (!expanded.ok) {
+        return {
+          blocked: true,
+          reason: expanded.reason + " · " + expanded.detail,
+          steps: [], total: 0, truncated: false, overLimit: false,
+          plan: false, budget: budget, variant: null,
+          macro: expanded.name,
+        };
+      }
+      const steps = expanded.steps.map(function (step) {
+        const hit = match(step);
+        return { text: step, via: hit ? hit.op : "router", exact: !!hit };
+      });
+      return {
+        blocked: false, reason: null, steps: steps,
+        total: expanded.total, truncated: false, overLimit: false,
+        plan: true, budget: budget, variant: null, macro: expanded.name,
+      };
+    }
+    const block = blockCapture(text);
+    if (block) {
+      const budget = previewBudget(text.length, 1, opts);
+      if (!block.ok) {
+        return { blocked: true, reason: block.reason, steps: [], total: 0,
+                 truncated: false, overLimit: false, plan: false, block: true,
+                 budget: budget, variant: null };
+      }
+      return { blocked: false, reason: null, total: 1, truncated: false,
+               overLimit: false, plan: false, block: true, budget: budget,
+               variant: null,
+               steps: [{ text: block.header, via: "block.write", exact: true }] };
+    }
+    const info = splitPromptInfo(text);
+    const budget = previewBudget(text.length, info.total, opts);
+    const rewrite = rewritePlan(text, info, budget, opts);
+    const over = rewrite ? rewrite.over : [];
+    if (over.length) {
+      const reason = over.indexOf("chars") >= 0
+        ? "query too long (" + text.length + " > " + LIMITS.plan
+          + "); split it into fewer steps"
+        : over.indexOf("steps") >= 0
+          ? "plan too long (" + info.total + " > " + LIMITS.steps + " steps)"
+          : over.indexOf("time") >= 0
+            ? "plan wall budget " + budget.planMs
+              + " ms is below the worst case (" + budget.steps + " steps × "
+              + budget.stepMs + " ms = " + budget.worstCaseMs
+              + " ms); raise toolrx.plan.timeout or split the plan"
+            : "plan would exceed the " + over.join(" and ") + " budget";
+      return { blocked: true, reason: reason, steps: [], total: info.total,
+               truncated: info.overLimit, overLimit: info.overLimit,
+               plan: info.plan, budget: budget, variant: rewrite };
+    }
+    const steps = info.steps.map(function (step) {
+      const hit = match(step);
+      return { text: step, via: hit ? hit.op : "router", exact: !!hit };
+    });
+    return { blocked: false, reason: null, steps: steps, total: info.total,
+             truncated: false, overLimit: false, plan: steps.length > 1,
+             budget: budget, variant: rewrite };
+  }
+
+  async function exec(skill, ctx) {
+    const fn = OPS[skill.op];
+    if (!fn) throw new Error("no handler for " + skill.op);
+    const out = await fn(skill.args, ctx);
+    if (out && typeof out === "object") return out;
+    return { text: cap(out === undefined ? "" : out) };
+  }
+
+  /* Resolve to {value}, {failure}, or {timedOut}. The step cap cannot always
+   * cancel work already in flight, so handlers also receive the deadline and
+   * the build path writes only after its own budget check. */
+  function withTimeout(promise, ms) {
+    return new Promise(function (resolve) {
+      let settled = false;
+      const timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        resolve({ timedOut: true });
+      }, ms);
+      promise.then(function (value) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ value: value });
+      }, function (failure) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ failure: failure });
+      });
+    });
+  }
+
+  async function runPrompt(query, ctx) {
+    const base = ctx || {};
+    const original = String(query == null ? "" : query);
+    let revisedFrom = null;
+    const finish = function (list, keepPending, actionText, extra) {
+      if (base.conversationRecord !== false) {
+        conversationRecord(base, original, list, {
+          keepPending: !!keepPending,
+          keepRepair: !!(extra && extra.keepRepair),
+          actionText: actionText || (revisedFrom ? query : original),
+        });
+      }
+      if (revisedFrom) {
+        list.forEach(function (r) { r.revised = revisedFrom; });
+      }
+      return list;
+    };
+    if (!base.conversationSkip) {
+      const conv = conversationBefore(original, base);
+      if (conv) {
+        if (conv.reply) {
+          const result = Object.assign({ step: original, planLength: 1 },
+                                       conv.reply);
+          return finish([result], conv.keepPending);
+        }
+        if (conv.confirm) {
+          // The staged action runs through the normal plan path, but with
+          // conversation interception and recording off. The confirmation
+          // itself is the turn that gets recorded, so a second "yes" finds
+          // nothing pending and cannot re-run the build.
+          const staged = conv.confirm.kind === "variant"
+            || conv.confirm.kind === "repair"
+            || conv.confirm.kind === "macro" ? conv.confirm : null;
+          const variant = staged && staged.kind === "variant" ? staged : null;
+          const repair = staged && staged.kind === "repair" ? staged : null;
+          const macro = staged && staged.kind === "macro" ? staged : null;
+          const inner = await runPrompt(staged
+            ? staged.steps.join("\n") : conv.confirm.text,
+            Object.assign({}, base, {
+              conversationSkip: true,
+              conversationRecord: false,
+              forcedSteps: staged ? staged.steps : null,
+              forcedVariant: variant,
+              forcedRepair: repair,
+              forcedMacro: macro,
+            }));
+          inner.forEach(function (r) { r.confirmed = conv.confirm.text; });
+          if (repair && !inner.some(function (r) { return r && r.error; })) {
+            clearRepair(base);
+          }
+          if (macro && inner.length) {
+            if (inner[0].error && inner[0].errorText == null) {
+              inner[0].errorText = String(inner[0].text || "");
+            }
+            inner[0].text = macroHeader(macro.macro || macro) + "\n\n"
+              + String(inner[0].text || "");
+            inner.forEach(function (r) { r.macro = macro.text; });
+          }
+          return finish(inner, false,
+            staged ? (variant ? (variant.variant.original || variant.text)
+              : repair ? repair.text : macro.text) : conv.confirm.text,
+            { keepRepair: !!repair });
+        }
+        if (conv.rewrite) {
+          query = conv.rewrite;
+          revisedFrom = conv.revisedFrom || original;
+        }
+      }
+    }
+    /* Step 67: macro preview, list, edit, and run. A preview stages the exact
+     * expanded list for a later yes, edit, or no. A run expands once and then
+     * reuses the forced-step path so nothing is split or re-planned. */
+    if (!base.conversationSkip) {
+      const hit = match(original);
+      if (hit && hit.op === "macro.preview") {
+        const result = macroPreviewRun(hit.args.name, base);
+        return finish([result], true);
+      }
+      if (hit && hit.op === "macro.list") {
+        return finish([macroListRun()], true);
+      }
+      if (hit && hit.op === "macro.edit") {
+        return finish([macroEditRun(hit.args.steps, base)], true);
+      }
+      if (hit && hit.op === "macro.run") {
+        const expanded = macroExpand(hit.args.name);
+        if (!expanded.ok) {
+          const M = macroModule();
+          return finish([{
+            step: original, via: "macro.run", error: true, planLength: 1,
+            text: M.previewText(expanded, macroLimits()),
+          }]);
+        }
+        const inner = await runPrompt(expanded.steps.join("\n"),
+          Object.assign({}, base, {
+            conversationSkip: true,
+            conversationRecord: false,
+            forcedSteps: expanded.steps,
+            forcedMacro: expanded,
+          }));
+        if (inner.length) {
+          if (inner[0].error && inner[0].errorText == null) {
+            inner[0].errorText = String(inner[0].text || "");
+          }
+          inner[0].text = macroHeader(expanded) + "\n\n"
+            + String(inner[0].text || "");
+          inner.forEach(function (r) { r.macro = expanded.name; });
+        }
+        return finish(inner, false, original);
+      }
+    }
+    /* Step 57: one-command partial-result continuation. A standalone resume
+     * reads the last run's plan, skips the failed step, and runs only the
+     * pending suffix. It never re-plans and never reruns completed steps. */
+    if (!base.conversationSkip) {
+      const hit = match(original);
+      if (hit && hit.op === "repair.resume") {
+        const R = root.toolrxRepair;
+        if (!R || typeof R.resume !== "function") {
+          return finish([{
+            step: original, error: true, via: "repair.resume",
+            planLength: 1,
+            text: "resume · the repair module is not loaded",
+          }]);
+        }
+        const state = typeof base.repair === "function" ? base.repair() : null;
+        const plan = state && state.plan;
+        const stepInfo = plan && Array.isArray(plan.steps)
+          ? plan.steps.map(function (text) {
+            const m = match(text);
+            return { text: text, op: m ? m.op : "router", exact: !!m };
+          }) : [];
+        const failedAt = plan && Number.isInteger(plan.failedAt)
+          ? plan.failedAt : -1;
+        const previous = readRepair(base);
+        const projectApi = base.project;
+        const hasProject = !!(projectApi
+          && typeof projectApi.active === "function" && projectApi.active());
+        const pendingTexts = failedAt >= 0
+          ? stepInfo.slice(failedAt + 1) : [];
+        const pendingNeedsProject = pendingTexts.some(function (step) {
+          return /^(?:project\.|edit\.)/.test(step.op);
+        });
+        const out = R.resume({
+          steps: stepInfo,
+          failedAt: failedAt,
+          errorText: plan ? String(plan.errorText || "") : "",
+          passes: previous ? Number(previous.passes) || 0 : 0,
+          maxPasses: LIMITS_RAW.repairPasses,
+          limits: {
+            planSteps: LIMITS_RAW.planSteps,
+            planChars: LIMITS_RAW.planChars,
+            planVariantBytes: LIMITS_RAW.planVariantBytes,
+          },
+          hasProject: hasProject,
+          pendingNeedsProject: pendingNeedsProject,
+          originalSteps: previous && Array.isArray(previous.original)
+            && previous.original.length ? previous.original.length
+            : stepInfo.length,
+        });
+        const body = R.resumeText(out);
+        const TR = root.toolrxTrace;
+        const trace = TR ? TR.record({
+          via: "repair.resume", text: body, rule: out.rule,
+          decision: out.kind, source: "last run",
+          planSteps: stepInfo.map(function (step) { return step.text; }),
+        }, { maxText: LIMITS.single, maxBytes: LIMITS_RAW.traceBytes }) : null;
+        if (out.kind !== "resume") {
+          return finish([{
+            step: original, text: body, via: "repair.resume",
+            error: true, planLength: 1, trace: trace,
+          }]);
+        }
+        const doc = R.record(out, {
+          steps: stepInfo,
+          originalSteps: stepInfo,
+          errorText: plan ? String(plan.errorText || "") : "",
+        }, { kind: "resume", maxText: LIMITS.single,
+             maxBytes: LIMITS_RAW.planVariantBytes });
+        if (!doc) {
+          const refused = body + "\nresume: none · the record is larger than "
+            + "planVariantBytes (" + LIMITS_RAW.planVariantBytes
+            + " bytes); nothing was run · r.resume-record";
+          return finish([{
+            step: original, text: refused, via: "repair.resume",
+            error: true, planLength: 1, trace: trace,
+          }]);
+        }
+        stageRepair(base, doc);
+        const pending = out.steps.map(function (step) { return step.text; });
+        const inner = await runPrompt(pending.join("\n"), Object.assign({},
+          base, {
+            conversationSkip: true,
+            conversationRecord: false,
+            forcedSteps: pending,
+            forcedResume: out,
+          }));
+        const failed = inner.some(function (r) { return r && r.error; });
+        if (!failed) clearRepair(base);
+        inner.forEach(function (r) { r.resumed = true; });
+        // Show what was skipped and what is running, but keep the first
+        // step's real error separate so the run record does not quote the
+        // resume header as the failure.
+        if (inner.length) {
+          if (inner[0].error && inner[0].errorText == null) {
+            inner[0].errorText = String(inner[0].text || "");
+          }
+          inner[0].text = body + "\n\n" + String(inner[0].text || "");
+        }
+        const last = inner[inner.length - 1];
+        if (last && trace) last.trace = trace;
+        return finish(inner, false, original, { keepRepair: failed });
+      }
+    }
+    const block = blockCapture(query);
+    if (block) {
+      const blockResult = runBlockWrite(block, base);
+      blockResult.planLength = 1;
+      return finish([blockResult]);
+    }
+    const limits = base.limits || {};
+    const stepMs = numberLimit(limits.stepMs, LIMITS.stepMs);
+    const planMs = numberLimit(limits.planMs, LIMITS.planMs);
+    const budgetOpts = {
+      stepMs: stepMs, planMs: planMs,
+      contextBytes: limits.contextBytes,
+      contextMax: limits.contextMax,
+      projectBytes: limits.projectBytes,
+      projectMax: limits.projectMax,
+    };
+    let steps;
+    if (Array.isArray(base.forcedSteps) && base.forcedSteps.length) {
+      // An accepted variant runs exactly the listed steps; nothing is
+      // re-split. If the project or context changed since it was staged, the
+      // variant is re-checked before anything writes.
+      steps = base.forcedSteps.map(function (step) { return String(step); });
+      const forcedBudget = previewBudget(steps.join("\n").length, steps.length,
+                                         budgetOpts);
+      const forcedInfo = { all: steps, steps: steps, total: steps.length,
+                           plan: true, overLimit: steps.length > LIMITS.steps };
+      const forcedRewrite = rewritePlan(steps.join("\n"), forcedInfo,
+                                        forcedBudget, limits);
+      if (forcedRewrite && forcedRewrite.over.length) {
+        const what = base.forcedResume ? "resume"
+          : base.forcedRepair ? "repair"
+            : base.forcedMacro ? "macro plan" : "compacted plan";
+        return finish([{
+          step: original, error: true,
+          via: base.forcedResume ? "repair.resume"
+            : base.forcedRepair ? "plan.repair"
+              : base.forcedMacro ? "macro.run" : "plan.variant",
+          planLength: 1,
+          text: "the " + what + " no longer fits ("
+            + forcedRewrite.over.join(" and ") + "); send the request again "
+            + "to rebuild it — nothing was run",
+        }]);
+      }
+    } else {
+      const preview = planPreview(query, budgetOpts);
+      if (preview.blocked) {
+        const v = preview.variant;
+        if (v && v.fits) {
+          const staged = stageVariant(base, v, original);
+          if (staged) {
+            stagePendingVariant(base, v, original);
+            return finish([{
+              step: String(query), text: variantText(v), via: "plan.variant",
+              planLength: 1,
+              variant: { name: v.name, steps: v.steps.length,
+                         dropped: v.dropped.length, over: v.over,
+                         droppedTexts: v.dropped.map(function (drop) {
+                           return String(drop.text);
+                         }) },
+            }], true);
+          }
+          return finish([{
+            step: String(query), error: true, via: "plan.variant",
+            planLength: 1,
+            text: "the compacted plan is too large to stage ("
+              + v.steps.length + " steps > " + LIMITS_RAW.planVariantBytes
+              + " bytes); nothing was run — split the request into smaller plans",
+          }]);
+        }
+        const via = v ? "plan.variant"
+          : /^plan wall budget/.test(String(preview.reason || ""))
+            ? "budget.plan" : "limit";
+        const text = v && !v.fits
+          ? preview.reason + "\n" + v.reason
+          : preview.reason;
+        return finish([{ step: String(query), text: text, error: true,
+                         via: via, planLength: 1 }]);
+      }
+      steps = preview.steps.map(function (s) { return s.text; });
+    }
+    const results = [];
+    let prev = "";
+    let prevResult = null;
+    const L = root.toolrxLang;
+    const clock = () => (typeof performance !== "undefined" && performance.now)
+      ? performance.now() : Date.now();
+    const planStarted = clock();
+    const reportStep = function (done) {
+      if (steps.length < 2 || typeof base.onStep !== "function") return;
+      try { base.onStep(done, steps.length, Math.round(clock() - planStarted)); }
+      catch (e) { /* a bad progress listener never breaks a plan */ }
+    };
+    reportStep(0);
+    for (const step of steps) {
+      const planElapsed = clock() - planStarted;
+      if (planElapsed >= planMs) {
+        results.push({
+          step: step, error: true, via: "budget.plan", ms: Math.round(planElapsed),
+          planLength: steps.length,
+          text: "plan wall budget " + planMs + " ms exhausted after "
+            + results.length + " step(s) — the plan stopped; previous project kept",
+        });
+        break;
+      }
+      const started = clock();
+      // Known localized intents normalize to their canonical English command.
+      // The original text stays on `result.step`; `working` drives matching and
+      // is forwarded to handlers so chat-style ops see the canonical sentence.
+      let working = step;
+      let interpreted = null;
+      if (L && L.normalize) {
+        const norm = L.normalize(step);
+        if (norm && norm.interpreted && norm.text) {
+          working = norm.text;
+          interpreted = norm;
+        }
+      }
+      const local = Object.assign({}, base, {
+        prev: prev, prevResult: prevResult, step: working,
+        deadline: started + stepMs, planDeadline: planStarted + planMs,
+      });
+      const runOne = async function () {
+        const skill = match(working);
+        if (skill) {
+          try {
+            const out = await exec(skill, local);
+            out.via = skill.op;
+            out.desc = skill.desc;
+            out.exact = true;
+            return out;
+          } catch (e) {
+            return { text: String(e.message || e), error: true,
+                     via: skill.op, desc: skill.desc };
+          }
+        }
+        if (base.fallback) return base.fallback(working, local);
+        return { text: shellSay("no_command") || "no command matched that step",
+                 error: true };
+      };
+      const outcome = await withTimeout(runOne(), stepMs);
+      let result;
+      if (outcome.timedOut) {
+        result = {
+          text: "step timed out after " + stepMs + " ms (step budget "
+            + stepMs + " ms) — the plan stopped; previous project kept",
+          error: true, via: "budget.timeout",
+        };
+      } else if (outcome.failure) {
+        result = { text: String(outcome.failure && outcome.failure.message
+          || outcome.failure), error: true, via: "budget.error" };
+      } else {
+        result = outcome.value || { text: "", error: false };
+      }
+      result.step = step;
+      result.planLength = steps.length;
+      if (interpreted) {
+        const label = L && L.say ? L.say(interpreted.lang, "interpreted") : "interpreted as";
+        result.lang = interpreted.lang;
+        result.interpreted = { lang: interpreted.lang, text: working };
+        result.text = (label || "interpreted as") + ": " + working
+          + (result.text ? "\n\n" + result.text : "");
+      }
+      result.ms = Math.max(0, Math.round(clock() - started));
+      if (result && result.text) { prev = result.text; prevResult = result; }
+      results.push(result);
+      reportStep(results.length);
+      // A failed step stops the plan; later steps may depend on its result.
+      if (result && result.error) break;
+    }
+    const failedAt = results.findIndex(function (r) { return r && r.error; });
+    results.plan = steps.slice();
+    results.failedAt = failedAt;
+    if (failedAt >= 0 && failedAt < steps.length - 1) {
+      const failed = results[failedAt];
+      const via = String(failed && failed.via || "");
+      if (failed && !/^(?:think|conversation|repair|plan)\./.test(via)) {
+        const pending = steps.length - failedAt - 1;
+        failed.text = String(failed.text || "")
+          + '\nrepair: say "repair this plan" for the smallest fix · or '
+          + '"resume" to run the ' + pending + " pending step(s)";
+      }
+    }
+    const keepPending = results.some(function (r) {
+      return r && r.keepPending;
+    });
+    const traced = results.slice().reverse().filter(function (r) {
+      return r && r.trace;
+    })[0];
+    if (traced) results.trace = traced.trace;
+    return finish(results, keepPending);
+  }
+
+  root.toolrxSkills = {
+    init: function (url) {
+      return fetch(url, { cache: "force-cache" })
+        .then(r => { if (!r.ok) throw new Error("commands " + r.status); return r.json(); })
+        .then(data => { compile(data); return true; })
+        .catch(() => false);
+    },
+    count: function () { return meta.count; },
+    categories: function () { return meta.categories; },
+    library: function () { return LIBRARY; },
+    librarySearch: function (q, n) { return libSearch(q, n); },
+    libraryPanel: function (q, opts) { return libPanel(q, opts); },
+    match: match,
+    search: search,
+    catalog: catalog,
+    limits: LIMITS,
+    limitsText: limitsText,
+    compute: function (src, limits, clock) { return computeRun(src, limits, clock); },
+    computeLimits: computeLimits,
+    splitPrompt: splitPrompt,
+    splitPromptInfo: splitPromptInfo,
+    planPreview: planPreview,
+    exec: exec,
+    runPrompt: runPrompt,
+    chat: chatReply,
+    summarize: summarizeText,
+    keyFacts: keyFactsOf,
+    reply: function () { return replyLang(); },
+    setReply: function (code) { return setReplyLang(code); },
+    help: function () { return helpText("", null); },
+  };
+})(typeof self !== "undefined" ? self : this);

@@ -1,3 +1,2 @@
-# GitHub Sponsors / Direct Web3 Payout config
-polar: aarkanum
-custom: ["https://polar.sh/aarkanum", "ethereum:0xec73439d04408adb6e7ec6a9bebf495c50580c45"]
+# GitHub Sponsors / Direct Checkout & Web3 Payout config
+custom: ["https://buy.polar.sh/polar_cl_oR8bnsHG4DuotdHtTdpmfYAnklv3WMMNskqmD2Po8DX", "ethereum:0xec73439d04408adb6e7ec6a9bebf495c50580c45"]

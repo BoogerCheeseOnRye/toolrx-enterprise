@@ -1,197 +1,274 @@
+"""Router: pick which tool a query should call, and decide its arguments.
+
+At runtime the query is embedded with the SAME hashing tokenizer used at
+build time, then scored against each tool's centroid vector by cosine
+similarity (dot product, since vectors are L2-normalized). The tool with
+the highest score wins; a confidence of 0 means the query didn't resemble
+any known tool.
 """
-ToolRouter: High-performance deterministic micro tool router for LLM/agent calling.
-Zero LLM dependencies, sub-millisecond edge latency, deterministic precision.
-"""
 
-import time
-from typing import Dict, List, Any, Optional, Set, Union
-from .core.schema import ToolDefinition, RouteResult, tokenize_identifier
-from .core.trie import TokenIndex
-from .core.matcher import DeterministicMatcher
+import json
+import os
+import re
 
-class ToolRouter:
+from tokhash import embed, dot, _DIM
+
+_WORDISH = re.compile(r"[A-Za-z0-9./_\-~]+")
+
+_NUM_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20,
+}
+
+
+def _ints_in(query):
+    out = [int(x) for x in re.findall(r"-?\d+", query)]
+    for tok in _WORDISH.findall(query.lower()):
+        if tok in _NUM_WORDS:
+            out.append(_NUM_WORDS[tok])
+    return out
+
+
+def load(model_path):
+    with open(model_path, encoding="utf-8") as f:
+        m = json.load(f)
+    m["centroids"] = {
+        name: {int(k): float(v) for k, v in c.items()}
+        for name, c in m["centroids"].items()
+    }
+    m["idf"] = {int(k): float(v) for k, v in m["idf"].items()}
+    m["_path"] = model_path
+    return m
+
+
+def _pick_path(query):
+    matches = _WORDISH.findall(query)
+    for m in matches:
+        if m in (".", ".."):
+            return m
+    for m in matches:
+        if ("/" in m or m.endswith((".txt", ".md", ".json", ".log", ".html", ".htm"))
+                or "." in m):
+            return m
+    return None
+
+
+def _path_candidates(query):
+    """All path-ish tokens, in order, for assigning to string params."""
+    return [m for m in _WORDISH.findall(query)
+            if ("/" in m or "." in m or m in (".", ".."))]
+
+
+def extract_args(query, param_specs, host_allowlist=None):
+    args = {}
+    host_param = next((p for p in param_specs if p.get("type") == "string"
+                       and p.get("name") == "host"), None)
+    if host_param:
+        cand = _extract_host(query, host_allowlist)
+        if cand:
+            args["host"] = cand
+    string_params = [p for p in param_specs
+                     if p.get("type") == "string" and p.get("name") != "host"
+                     and p.get("name") in ("path", "path_a", "path_b", "file", "dir", "target")]
+    for p in param_specs:
+        name, ptype = p["name"], p["type"]
+        if name == "name" and ptype == "string":
+            mname = _extract_module_name(query)
+            if mname is not None:
+                args[name] = mname
+        if name == "tool" and ptype == "string":
+            mtool = _extract_module_tool(query)
+            if mtool is not None:
+                args[name] = mtool
+    cands = _path_candidates(query)       # pop from end -> last path first
+    for p in reversed(string_params):     # assign the LAST path param first
+        name = p["name"]
+        if name in args:
+            continue
+        if cands:
+            args[name] = cands.pop()
+        elif "default" in p:
+            args[name] = p["default"]
+    # remaining non-path string params (content, mode, ...) -> defaults
+    for p in param_specs:
+        name, ptype = p["name"], p["type"]
+        if ptype == "string" and name not in args and name not in ("host",) and "default" in p:
+            args.setdefault(name, p["default"])
+    for p in param_specs:
+        name, ptype = p["name"], p["type"]
+        if name == "interval" and ptype == "int":
+            iv = _extract_interval(query)
+            if iv is not None:
+                args[name] = iv
+            elif name not in args and "default" in p:
+                args[name] = p["default"]
+        elif name == "duration" and ptype == "int":
+            du = _extract_duration(query)
+            if du is not None:
+                args[name] = du
+        elif ptype == "int_list":
+            nums = _ints_in(query)
+            if nums:
+                args[name] = nums
+        if name not in args and "default" in p:
+            args.setdefault(name, p["default"])
+    _extract_content(query, param_specs, args)
+    return args
+
+
+def _quoted_or_fenced_content(text):
+    """Return the first fenced/triple-quoted block, if one is present."""
+    for pattern in (r"```[^\n]*\n?(.*?)```",
+                    r'"""(.*?)"""',
+                    r"'''(.*?)'''"):
+        m = re.search(pattern, text, re.DOTALL)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _strip_single_quotes(text):
+    s = text.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    return s
+
+
+def _extract_content(query, param_specs, args):
+    """For a 'content' param, take everything after the first ':' or after the
+    extracted path token(s).
+
+    Multi-sentence content, fenced blocks, triple-quoted blocks, and indented
+    lists are preserved verbatim. When several paths were extracted, every one
+    of them is removed before the remaining content is derived, so a
+    multi-path request does not leak a filename into the content.
     """
-    Zero-LLM deterministic tool router.
-    Prunes hundreds of tools down to the exact relevant top-k tools in microseconds,
-    slashing prompt token costs and LLM latency while eliminating hallucinations.
-    """
+    if not any(p.get("name") == "content" for p in param_specs):
+        return
+    if "content" in args and args.get("content"):
+        return
+    q = query
 
-    def __init__(self, tools: Optional[List[Union[Dict[str, Any], ToolDefinition]]] = None):
-        self.tools: Dict[str, ToolDefinition] = {}
-        self.token_index = TokenIndex()
-        self.matcher = DeterministicMatcher(self.tools)
-        self.default_fallback: List[str] = []
+    fenced = _quoted_or_fenced_content(q)
+    if fenced is not None:
+        args["content"] = fenced.rstrip("\n")
+        return
 
-        if tools:
-            self.register_tools(tools)
+    if ":" in q:
+        args["content"] = _strip_single_quotes(q.split(":", 1)[1])
+        return
 
-    def register_tool(self, tool: Union[Dict[str, Any], ToolDefinition]) -> ToolDefinition:
-        """Register a single tool into the deterministic index."""
-        if isinstance(tool, dict):
-            tool_def = ToolDefinition.from_dict(tool)
-        elif isinstance(tool, ToolDefinition):
-            tool_def = tool
-        else:
-            raise TypeError(f"Expected dict or ToolDefinition, got {type(tool)}")
+    path_names = ("path", "path_a", "path_b", "file", "dir", "target")
+    for name in path_names:
+        value = args.get(name)
+        if isinstance(value, str) and value:
+            q = q.replace(value, "", 1)
+    # strip leading edit verbs / filler
+    q = re.sub(r"^(write|create|edit|save|append|update|set|make|add|change|put|insert|with|to|in|the|a|an|for|contents?|as)\b\s*",
+               "", q, count=6)
+    q = q.strip(" :")
+    args["content"] = _strip_single_quotes(q)
 
-        self.tools[tool_def.name] = tool_def
-        self.token_index.add_tool_tokens(
-            tool_name=tool_def.name,
-            name_tokens=tool_def.name_tokens,
-            desc_tokens=tool_def.desc_tokens,
-            param_tokens={tok for p in tool_def.parameters.values() for tok in p.tokens},
-            tags=tool_def.tags
-        )
-        self.matcher.reindex()
-        return tool_def
 
-    def register_tools(self, tools: List[Union[Dict[str, Any], ToolDefinition]]) -> None:
-        """Register a batch of tools."""
-        for t in tools:
-            if isinstance(t, dict):
-                tool_def = ToolDefinition.from_dict(t)
-            elif isinstance(t, ToolDefinition):
-                tool_def = t
-            else:
-                continue
-            self.tools[tool_def.name] = tool_def
-            self.token_index.add_tool_tokens(
-                tool_name=tool_def.name,
-                name_tokens=tool_def.name_tokens,
-                desc_tokens=tool_def.desc_tokens,
-                param_tokens={tok for p in tool_def.parameters.values() for tok in p.tokens},
-                tags=tool_def.tags
-            )
-        self.matcher.reindex()
+def _extract_interval(query):
+    """Pull the number from 'every 5 seconds' / 'each 10s' / 'every 30'."""
+    m = re.search(r"(?:every|each|per)\s+(\d+)", query)
+    if not m:
+        m = re.search(r"(\d+)\s*(?:seconds?|secs?|\bs\b)", query)
+    if m:
+        return int(m.group(1))
+    return None
 
-    def add_rule(self, pattern: str, target_tool: str, boost: float = 10.0) -> None:
-        """Add an explicit regex routing rule for deterministic enforcement."""
-        self.matcher.add_rule(pattern, target_tool, boost)
 
-    def set_fallback_tools(self, tool_names: List[str]) -> None:
-        """Set default fallback tools to return if no tool matches query."""
-        self.default_fallback = list(tool_names)
+def _extract_duration(query):
+    """Pull 'for N minutes/seconds/min/s' -> seconds (duration)."""
+    m = re.search(r"(?:for|during|over)\s+(\d+)\s*(minutes?|mins?|seconds?|secs?)", query)
+    if not m:
+        m = re.search(r"(\d+)\s*(minutes?|mins?)", query)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        return n * 60 if unit.startswith("min") else n
+    return None
 
-    def route(
-        self,
-        query: str,
-        top_k: int = 3,
-        min_score: float = 1.0,
-        fallback_tools: Optional[List[str]] = None
-    ) -> RouteResult:
-        """
-        Route a user/agent query to the top-k relevant tools in microseconds.
-        Returns RouteResult containing selected tools, scores, latency, and token metrics.
-        """
-        start_ns = time.perf_counter_ns()
 
-        query_tokens = tokenize_identifier(query)
+def _extract_module_name(query):
+    """Map a tracker intent to a known module name (memory/disk/uptime)."""
+    low = query.lower()
+    for cand in ("memory", "disk", "uptime"):
+        if cand in low:
+            return cand
+    return None
 
-        # Stage 1: Fast Trie & Inverted Token Index lookup (< 15 microseconds)
-        base_scores = self.token_index.query_tokens(query_tokens, allow_prefix=True)
 
-        # Stage 2: Deterministic multi-factor scoring (rules, parameters, negations) (< 20 microseconds)
-        scores, explanations = self.matcher.match(query, base_scores)
+def _extract_module_tool(query):
+    """Map 'ping / disk / memory / processes / uptime ...' to a read-only tool."""
+    low = query.lower()
+    if "ping" in low:
+        return "net.ping"
+    if "disk" in low:
+        return "sys.disk"
+    if "memory" in low or "ram" in low:
+        return "sys.mem_status"
+    if "process" in low:
+        return "sys.processes"
+    if "uptime" in low or "up time" in low:
+        return "sys.uptime"
+    if "interface" in low or "netw" in low:
+        return "sys.ifconfig"
+    if "port" in low or "listen" in low:
+        return "sys.netstat"
+    return None
 
-        # Stage 3: Ranking and Filtering
-        ranked = sorted(
-            [(t, s) for t, s in scores.items() if s >= min_score],
-            key=lambda x: x[1],
-            reverse=True
-        )
 
-        selected = [t for t, _ in ranked[:top_k]]
+def _extract_host(query, host_allowlist=None):
+    host_allowlist = host_allowlist or []
+    toks = [m for m in _WORDISH.findall(query) if "." in m or m.isalpha()]
+    for t in toks:
+        if t in host_allowlist:
+            return t
+    # "local machine" phrasing -> the loopback host (only if allowlisted)
+    if any(t in ("local", "localhost") for t in toks) and "localhost" in host_allowlist:
+        return "localhost"
+    # fallback: last alphabetic/path token (executor enforces the allowlist)
+    return toks[-1] if toks else None
 
-        # Fallback if no matching tools met min_score
-        if not selected:
-            effective_fallback = fallback_tools if fallback_tools is not None else self.default_fallback
-            selected = [t for t in effective_fallback if t in self.tools][:top_k]
 
-        elapsed_us = (time.perf_counter_ns() - start_ns) / 1_000.0
+def route(query, model, top_k=1, host_allowlist=None):
+    qv = embed(query, model.get("dim", _DIM), model["idf"])
+    scores = {name: dot(qv, c) for name, c in model["centroids"].items()}
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    best_name, best_score = ranked[0]
+    runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
+    tool = model["tools"][0]["name"]
+    for t in model["tools"]:
+        if t["name"] == best_name:
+            tool = t
+            break
+    return {
+        "query": query,
+        "tool": best_name,
+        "confidence": round(best_score, 4),
+        "margin": round(best_score - runner_up, 4),
+        "scores": {n: round(s, 4) for n, s in dict(ranked).items()},
+        "args": extract_args(query, tool["params"], host_allowlist),
+    }
 
-        # Token savings accounting
-        total_prompt_tokens = sum(t.estimated_tokens for t in self.tools.values())
-        routed_prompt_tokens = sum(self.tools[t].estimated_tokens for t in selected if t in self.tools)
-        tokens_saved = max(0, total_prompt_tokens - routed_prompt_tokens)
-        savings_pct = (tokens_saved / total_prompt_tokens * 100.0) if total_prompt_tokens > 0 else 0.0
 
-        return RouteResult(
-            query=query,
-            selected_tools=selected,
-            scores={t: scores.get(t, 0.0) for t in selected},
-            all_evaluated_count=len(self.tools),
-            selected_count=len(selected),
-            latency_microseconds=round(elapsed_us, 2),
-            estimated_prompt_tokens_original=total_prompt_tokens,
-            estimated_prompt_tokens_routed=routed_prompt_tokens,
-            tokens_saved=tokens_saved,
-            token_savings_pct=round(savings_pct, 1),
-            explanation={t: explanations.get(t, []) for t in selected}
-        )
+def main():
+    model = load("micro_model.json")
+    for q in [
+        "add five and seven",
+        "read my notes.txt",
+        "how much memory is free on this machine",
+        "list the files in the project folder",
+    ]:
+        r = route(q, model)
+        print(f"\nQ: {q!r}\n   -> {r['tool']}  conf={r['confidence']} args={r['args']}")
 
-    def prune_tools(
-        self,
-        query: str,
-        top_k: int = 5,
-        min_score: float = 1.0,
-        tools: Optional[List[Dict[str, Any]]] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Drop-in pruning utility: takes query and returns original tool definitions
-        filtered to top-k relevant tools.
-        """
-        if tools:
-            # Ephemeral routing over provided tools
-            temp_router = ToolRouter(tools)
-            result = temp_router.route(query, top_k=top_k, min_score=min_score)
-            return [temp_router.tools[name].raw_schema for name in result.selected_tools if name in temp_router.tools]
 
-        result = self.route(query, top_k=top_k, min_score=min_score)
-        return [self.tools[name].raw_schema for name in result.selected_tools if name in self.tools]
-
-    def register(
-        self,
-        fn: Optional[Any] = None,
-        *,
-        name: Optional[str] = None,
-        description: Optional[str] = None,
-        triggers: Optional[List[str]] = None,
-        tags: Optional[List[str]] = None,
-    ):
-        """
-        Decorator or function to register a callable or schema into ToolRouter.
-        Supports:
-            @router.register(name="tool_name", triggers=["keyword1", "keyword2"])
-            def my_tool(): ...
-        """
-        def decorator(target):
-            tool_name = name or getattr(target, "__name__", "unnamed_tool")
-            doc = description or getattr(target, "__doc__", "") or ""
-            all_tags = list(tags or [])
-            if triggers:
-                all_tags.extend(triggers)
-
-            tool_def = ToolDefinition(
-                name=tool_name,
-                description=doc,
-                tags=set(all_tags),
-                raw_schema={"name": tool_name, "description": doc}
-            )
-            self.tools[tool_name] = tool_def
-            self.token_index.add_tool_tokens(
-                tool_name=tool_name,
-                name_tokens=tool_def.name_tokens,
-                desc_tokens=tool_def.desc_tokens,
-                param_tokens=set(all_tags),
-                tags=tool_def.tags
-            )
-            self.matcher.reindex()
-            return target
-
-        if fn is not None:
-            return decorator(fn)
-        return decorator
-
-    def match(self, query: str, top_k: int = 1) -> Optional[RouteResult]:
-        """Convenience alias for route(query, top_k)."""
-        return self.route(query, top_k=top_k)
+if __name__ == "__main__":
+    main()

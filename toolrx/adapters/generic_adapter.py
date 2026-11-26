@@ -3,7 +3,7 @@ Generic adapter utilities for LLM orchestration frameworks (LangChain, LiteLLM, 
 """
 
 from typing import Dict, List, Any, Callable
-from ..router import ToolRouter
+from ..compat import ToolRouter
 
 class GenericToolAdapter:
     """Utility to adapt arbitrary callable tools or schema definitions."""

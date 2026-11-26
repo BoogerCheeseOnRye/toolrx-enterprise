@@ -4,7 +4,7 @@ Transparently prunes tools in chat completion requests to save tokens and cut TT
 """
 
 from typing import Dict, List, Any, Optional
-from ..router import ToolRouter
+from ..compat import ToolRouter
 
 class ToolRxOpenAI:
     """Drop-in adapter for OpenAI chat completion payloads."""
